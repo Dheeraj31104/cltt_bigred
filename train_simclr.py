@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
+from torchvision import models
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -31,52 +32,77 @@ except ImportError:
 # -----------------------
 #    Model + Loss
 # -----------------------
-class NTXentLoss(nn.Module):
-    """SimCLR NT-Xent loss."""
-
-    def __init__(self, temperature: float = 0.5):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-        assert z1.shape == z2.shape, "z1 and z2 must have the same shape"
-        n, _ = z1.shape
-
-        z1 = F.normalize(z1, dim=1)
-        z2 = F.normalize(z2, dim=1)
-        z = torch.cat([z1, z2], dim=0)  # [2N, D]
-
-        sim = torch.matmul(z, z.T) / self.temperature  # [2N, 2N]
-        diag = torch.eye(2 * n, device=sim.device, dtype=torch.bool)
-        sim = sim.masked_fill(diag, -9e15)
-
-        targets = torch.arange(n, device=sim.device)
-        targets = torch.cat([targets + n, targets], dim=0)
-
-        loss = F.cross_entropy(sim, targets)
-        return loss
 
 
-class SimCLRResNet50(nn.Module):
+class SimCLRResNet18(nn.Module):
     def __init__(self, proj_dim: int = 128):
         super().__init__()
-        from torchvision import models
 
-        base = models.resnet50(weights=None)
-        num_ftrs = base.fc.in_features
+        base = models.resnet18(weights=None)
+        num_ftrs = base.fc.in_features  # 512 for ResNet-18
         base.fc = nn.Identity()
 
         self.encoder = base
         self.projection_head = nn.Sequential(
-            nn.Linear(num_ftrs, num_ftrs),
+            nn.Linear(num_ftrs, num_ftrs),   # bias unchanged (default True)
+            nn.BatchNorm1d(num_ftrs),
             nn.ReLU(inplace=True),
-            nn.Linear(num_ftrs, proj_dim),
+            nn.Linear(num_ftrs, proj_dim),   # bias unchanged (default True)
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.encoder(x)
-        z = self.projection_head(h)
+        h = self.encoder(x)             # (B, 512)
+        z = self.projection_head(h)     # (B, proj_dim)
         return h, z
+
+class PairedCosineTTLoss(nn.Module):
+    """
+    Buffer contains consecutive positive pairs:
+      (0,1), (2,3), ..., (N-2, N-1)
+
+    For each anchor i:
+      numerator: exp(sim(i, pos(i))/tau)
+      denominator: sum_{k != i and k != pos(i)} exp(sim(i,k)/tau)
+    """
+    def __init__(self, temperature: float = 0.5, eps: float = 1e-8):
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: (N, D) where N is even and ordered in positive pairs.
+        returns: scalar loss averaged over N anchors
+        """
+        if z.dim() != 2:
+            raise ValueError(f"Expected z to be (N, D), got {tuple(z.shape)}")
+        N, _ = z.shape
+        if N % 2 != 0:
+            raise ValueError(f"N must be even (pairs), got N={N}")
+
+        # cosine similarity via normalized dot product
+        z = F.normalize(z, dim=1, eps=self.eps)
+        sim = (z @ z.T) / self.temperature  # (N, N)
+
+        # pos index mapping for consecutive pairs: 0<->1, 2<->3, ...
+        idx = torch.arange(N, device=z.device)
+        pos_idx = idx ^ 1  # flips last bit: even->odd, odd->even
+
+        # positive logits: sim[i, pos(i)]
+        pos_logits = sim[idx, pos_idx]  # (N,)
+
+        # build mask for negatives: exclude self and exclude positive
+        neg_mask = torch.ones((N, N), dtype=torch.bool, device=z.device)
+        neg_mask.fill_diagonal_(False)                 # exclude self
+        neg_mask[idx, pos_idx] = False                 # exclude positive
+
+        # collect negatives per anchor: (N, N-2)
+        neg_logits = sim[neg_mask].view(N, N - 2)
+
+        # loss per anchor: -( pos - logsumexp(negs) )
+        loss_per = -(pos_logits - torch.logsumexp(neg_logits, dim=1))
+        return loss_per.mean()
+
 
 
 # -----------------------
@@ -114,7 +140,6 @@ def build_transforms(image_size: int = 224) -> T.Compose:
 
 
 def _find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
-    pattern = os.path.join(checkpoint_dir, "simclr_epoch_*.pth")
     ckpts = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.startswith("simclr_epoch_")]
     if not ckpts:
         return None
@@ -205,8 +230,8 @@ def train_simclr_from_buffer(
         pin_memory=device.type == "cuda",
     )
 
-    model = SimCLRResNet50(proj_dim=proj_dim).to(device)
-    criterion = NTXentLoss(temperature=temperature)
+    model = SimCLRResNet18(proj_dim=proj_dim).to(device)
+    criterion = PairedCosineTTLoss(temperature=temperature)
 
     optimizer = torch.optim.Adam(
         [
@@ -218,6 +243,8 @@ def train_simclr_from_buffer(
 
     start_epoch = 1
     history = {"epoch_loss": []}
+    scheduler_state_dict = None
+    global_step = 0
 
     if checkpoint_dir is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -233,6 +260,8 @@ def train_simclr_from_buffer(
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             start_epoch = ckpt.get("epoch", 0) + 1
             history = ckpt.get("history", {"epoch_loss": []})
+            scheduler_state_dict = ckpt.get("scheduler_state_dict")
+            global_step = ckpt.get("global_step", 0)
         else:
             print("[WARN] resume enabled but checkpoint not found; starting fresh.")
 
@@ -241,8 +270,8 @@ def train_simclr_from_buffer(
         T_max=epochs,
         last_epoch=start_epoch - 2,  # step() will move to start_epoch-1
     )
-
-    global_step = 0
+    if scheduler_state_dict is not None:
+        scheduler.load_state_dict(scheduler_state_dict)
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
@@ -263,9 +292,13 @@ def train_simclr_from_buffer(
             if sub_batch_size is None or sub_batch_size >= bsz:
                 x = torch.cat([v0, v1], dim=0)
                 _, z = model(x)
-                z1, z2 = torch.chunk(z, 2, dim=0)
+                z1, z2 = torch.chunk(z, 2, dim=0)  
+                           
 
-                loss = criterion(z1, z2)
+                # interleave: [z1_0, z2_0, z1_1, z2_1, ...] -> (2B, D)
+                z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
+
+                loss = criterion(z_pairs)  # <-- loss expects single tensor
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -287,7 +320,9 @@ def train_simclr_from_buffer(
                     _, z = model(x)
                     z1, z2 = torch.chunk(z, 2, dim=0)
 
-                    loss_sub = criterion(z1, z2)
+                    z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
+                    loss_sub = criterion(z_pairs)
+
                     loss_scaled = loss_sub * (sub_b / bsz)
                     loss_scaled.backward()
                     total_loss += loss_sub.item() * (sub_b / bsz)
@@ -331,7 +366,7 @@ def train_simclr_from_buffer(
                     "train/batches": num_batches,
                     "train/epoch": epoch,
                 },
-                step=global_step,
+                step=epoch,
             )
 
         if checkpoint_dir is not None:
@@ -342,8 +377,10 @@ def train_simclr_from_buffer(
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "proj_dim": proj_dim,
-                    "backbone": "resnet50",
+                    "backbone": "resnet18",
                     "history": history,
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "global_step": global_step,
                 },
                 ckpt_path,
             )
@@ -357,8 +394,10 @@ def train_simclr_from_buffer(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "proj_dim": proj_dim,
-                "backbone": "resnet50",
+                "backbone": "resnet18",
                 "history": history,
+                "scheduler_state_dict": scheduler.state_dict(),
+                "global_step": global_step,
             },
             final_path,
         )
