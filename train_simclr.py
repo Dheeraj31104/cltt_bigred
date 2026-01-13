@@ -463,7 +463,7 @@ def main() -> None:
         root_dir=args.root_dir,
         window_size=args.window_size,
         frame_step=args.frame_step,
-        transform=transform,
+        transform=transform,    
         return_stack=True,
         verbose=True,
         use_object_focus=args.use_object_focus,
