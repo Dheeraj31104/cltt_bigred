@@ -2,6 +2,7 @@
 # Example Slurm job array to sweep several SimCLR runs.
 # Edit the SBATCH lines to match your cluster defaults before submitting.
 
+#SBATCH -A r00117          # project account
 #SBATCH --job-name=simclr_ego
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
