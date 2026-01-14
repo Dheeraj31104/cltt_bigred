@@ -2,13 +2,13 @@
 # Example Slurm job array to sweep several SimCLR runs.
 # Edit the SBATCH lines to match your cluster defaults before submitting.
 
-#SBATCH -A r00117          # project account
+#SBATCH -p gpu
+#SBATCH -A r00117
 #SBATCH --job-name=simclr_ego
-#SBATCH --gres=gpu:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
-#SBATCH --array=0-2
+#SBATCH --time=6:00:00
 #SBATCH --output=logs/simclr_%A_%a.out
 #SBATCH --mail-user=dhkara@iu.edu
 #SBATCH --mail-type=BEGIN,END,REQUEUE
@@ -35,6 +35,8 @@ WANDB_MODE="online"                    # online|offline|disabled
 module load conda
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate torch-env
+# Interactive helper:
+# srun -p gpu -A r00117 --gpus-per-node 1 --time=6:00:00 --pty bash
 
 requeue_job() {
   if [[ -n "${SLURM_JOB_ID:-}" ]]; then
