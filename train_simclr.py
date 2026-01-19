@@ -168,6 +168,10 @@ def _prepare_views(
     """
     if isinstance(batch, (list, tuple)):
         v0, v1 = batch
+        # If dataset returns window stacks, select first/last frame.
+        if v0.dim() == 5:
+            v0 = v0[:, 0]
+            v1 = v1[:, -1]
         return v0.to(device), v1.to(device)
 
     batch = batch.to(device)
