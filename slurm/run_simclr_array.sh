@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # ---- User settings (edit these) ---------------------------------------------
-ROOT_DIR="/N/project/cogai/dhkara/cropped_clips/cltt_bigred"          # folder with extracted frame folders
+ROOT_DIR="/N/project/cogai/dhkara/cropped_clips"          # folder with extracted frame folders
 CHECKPOINT_ROOT="$PWD/checkpoints"      # base output dir for checkpoints
 EPOCHS=100
 SUB_BATCH_SIZE=""                      # set to "" to disable grad accumulation
