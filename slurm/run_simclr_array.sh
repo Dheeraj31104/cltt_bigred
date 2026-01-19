@@ -94,7 +94,6 @@ if [[ "${ENABLE_WANDB}" == "1" ]]; then
   EXTRA_ARGS+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-mode "$WANDB_MODE")
   [[ -n "${WANDB_ENTITY}" ]] && EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY")
   EXTRA_ARGS+=(--wandb-name "${RUN_NAME}")
-  EXTRA_ARGS+=(--wandb-id "${RUN_NAME}" --wandb-resume "allow")
 fi
 
 echo "Starting run ${RUN_NAME}"
