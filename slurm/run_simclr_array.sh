@@ -33,7 +33,7 @@ WANDB_MODE="online"                    # online|offline|disabled
 : "${PS1:=}"
 set +u
 module load conda
-source ~/miniconda3/etc/profile.d/conda.sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate torch-env
 set -u
 # Interactive helper:
