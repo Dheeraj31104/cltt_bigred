@@ -1,7 +1,7 @@
-CLTT BigRed — Contrastive Learning Through Time for Egocentric Windows (WIP)
+Contrastive Learning Through Time for Egocentric Windows (WIP)
 Overview
 
-CLTT BigRed trains a SimCLR-style contrastive model on egocentric video frame windows, leveraging temporal adjacency to form positive pairs (“contrastive learning through time”) alongside standard augmentations. The codebase is designed to be HPC/Slurm-friendly and supports reproducible experiments via a CLI, checkpointing, and optional Weights & Biases logging.
+CLTT  trains a SimCLR-style contrastive model on egocentric video frame windows, leveraging temporal adjacency to form positive pairs (“contrastive learning through time”) alongside standard augmentations. The codebase is designed to be HPC/Slurm-friendly and supports reproducible experiments via a CLI, checkpointing, and optional Weights & Biases logging.
 
 Key Features
 
@@ -148,3 +148,4 @@ BibTeX
 Quick tip (so GitHub renders it nicely)
 
 Make sure the file name is exactly README.md and the content is not indented with 4 leading spaces on every line (that turns it into a code block).
+
