@@ -127,7 +127,7 @@ If you use this repository for academic work, please cite:
 
 SimCLR: Chen, T., Kornblith, S., Norouzi, M., & Hinton, G. (2020). A Simple Framework for Contrastive Learning of Visual Representations. ICML.
 
-CLTT / Contrastive Learning Through Time: (Add the specific paper citation you are following here.)
+CLTT / Contrastive Learning Through Time: ((https://openreview.net/forum?id=HTCRs8taN8))
 
 BibTeX
 @inproceedings{chen2020simclr,
@@ -148,4 +148,5 @@ BibTeX
 Quick tip (so GitHub renders it nicely)
 
 Make sure the file name is exactly README.md and the content is not indented with 4 leading spaces on every line (that turns it into a code block).
+
 
