@@ -1,53 +1,86 @@
-Contrastive Learning Through Time for Egocentric Windows (WIP)
-Overview
+# Contrastive Learning Through Time for Egocentric Windows (CLTT)
 
-CLTT  trains a SimCLR-style contrastive model on egocentric video frame windows, leveraging temporal adjacency to form positive pairs (“contrastive learning through time”) alongside standard augmentations. The codebase is designed to be HPC/Slurm-friendly and supports reproducible experiments via a CLI, checkpointing, and optional Weights & Biases logging.
+**Status:** Work in Progress 🚧
 
-Key Features
+CLTT trains a SimCLR-style contrastive model on egocentric video **frame windows**, leveraging **temporal adjacency** to form positive pairs—a setting we refer to as *contrastive learning through time*. In addition to standard data augmentations, temporally offset windows are treated as positives to encourage temporal consistency in learned representations.
 
-Sliding-window dataset for egocentric frames (single-view and paired-view modes)
+The codebase is designed to be **HPC/Slurm-friendly**, supports **reproducible experiments**, and provides a clean **CLI interface** with checkpointing and optional Weights & Biases logging.
 
-Paired-window temporal positives via configurable time offsets (--two-view-offset)
+---
 
-Reproducible training: checkpoints, resume support, configurable runs
+## Key Features
 
-Slurm job-array template for sweeps on HPC clusters
+* **Sliding-window egocentric dataset**
 
-Optional object-focus transform that blurs backgrounds using placeholder bounding boxes (swap-in real detector outputs)
+  * Supports single-view and paired-view (temporal positive) modes
+* **Temporal contrastive pairs**
 
-Repository Structure
+  * Configurable temporal offsets via `--two-view-offset`
+* **Reproducible training**
 
-train_simclr.py — main training script (CLI, checkpoints, wandb, resume)
+  * Checkpointing, resume support, and configurable experiment runs
+* **HPC-ready**
 
-utils/EgocentricWindowDataset_new.py — dataset for frame windows and paired temporal views
+  * Slurm job-array template for large-scale sweeps
+* **Optional object-focused augmentation**
 
-slurm/run_simclr_array.sh — Slurm job array template
+  * Background blurring using placeholder bounding boxes (easily replaceable with real detector outputs)
 
-requirements.txt — Python dependencies
+---
 
-Setup
-1) Create and activate a Python environment
+## Repository Structure
+
+```
+.
+├── train_simclr.py                 # Main training script (CLI, checkpoints, W&B, resume)
+├── utils/
+│   └── EgocentricWindowDataset_new.py  # Dataset for frame windows and temporal pairs
+├── slurm/
+│   └── run_simclr_array.sh          # Slurm job-array template
+├── requirements.txt                # Python dependencies
+└── README.md
+```
+
+---
+
+## Setup
+
+### 1. Create and activate a Python environment
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
+```
 
-2) Install dependencies
+### 2. Install dependencies
+
+```bash
 pip install -r requirements.txt
+```
 
-3) Data format (extracted frames)
+### 3. Data format (extracted frames)
 
-Organize extracted frames by clip:
+Organize extracted frames by clip directory:
 
+```
 root_dir/
-  clip_001/
-    frame_0001.jpg
-    frame_0002.jpg
-    ...
-  clip_002/
-    frame_0001.jpg
-    ...
+├── clip_001/
+│   ├── frame_0001.jpg
+│   ├── frame_0002.jpg
+│   └── ...
+├── clip_002/
+│   ├── frame_0001.jpg
+│   └── ...
+└── ...
+```
 
-Usage
-Local run (single node)
+---
+
+## Usage
+
+### Local run (single node)
+
+```bash
 python train_simclr.py \
   --root-dir /path/to/frames \
   --window-size 5 \
@@ -55,11 +88,13 @@ python train_simclr.py \
   --batch-size 64 \
   --epochs 25 \
   --checkpoint-dir checkpoints/run1
+```
 
-Paired-window mode (temporal positives with offset)
+### Paired-window mode (temporal positives)
 
-Creates two temporally offset views of a window: (view0, view1).
+Creates two temporally offset views of the same window: `(view0, view1)`.
 
+```bash
 python train_simclr.py \
   --root-dir /path/to/frames \
   --window-size 5 \
@@ -67,69 +102,90 @@ python train_simclr.py \
   --two-view-offset 1 \
   --batch-size 64 \
   --epochs 25
+```
 
-Enable object-focus mode (placeholder boxes)
+### Enable object-focus mode (placeholder bounding boxes)
+
+```bash
 python train_simclr.py \
   --root-dir /path/to/frames \
   --use-object-focus \
   ...
+```
 
-Slurm job array (HPC)
+### Slurm job array (HPC)
 
-Edit slurm/run_simclr_array.sh (paths, resources, hyperparams)
+1. Edit `slurm/run_simclr_array.sh` to configure paths, resources, and hyperparameters.
+2. Submit the job array:
 
-Submit:
-
+```bash
 sbatch slurm/run_simclr_array.sh
+```
 
-Implementation Notes
-Dataset windows
+---
 
-Single-view mode returns a stacked tensor shaped like [W, C, H, W] (W = window size)
+## Implementation Notes
 
-Two-view mode returns (view0, view1) where each view is a stacked window
+### Dataset windows
 
-Object-focus transform
+* **Single-view mode** returns a stacked tensor of shape:
 
-Current implementation uses a central dummy box (get_bboxes_dummy()).
+  ```
+  [W, C, H, W]
+  ```
 
-Replace dummy boxes with real detector outputs to study object-centric temporal consistency.
+  where `W` is the temporal window size.
 
-Checkpointing
+* **Two-view mode** returns a tuple `(view0, view1)`, where each element is a stacked temporal window.
 
-Checkpoints are saved as simclr_epoch_XXX.pth and simclr_final.pth.
+### Object-focus transform
+
+* The current implementation uses a **dummy central bounding box** via `get_bboxes_dummy()`.
+* This is intended as a placeholder and can be replaced with real detector outputs to study **object-centric temporal consistency**.
+
+### Checkpointing and resume
+
+* Checkpoints are saved as:
+
+  * `simclr_epoch_XXX.pth`
+  * `simclr_final.pth`
 
 Resume options:
 
---resume loads the latest checkpoint from --checkpoint-dir
+* `--resume` loads the latest checkpoint from `--checkpoint-dir`
+* `--checkpoint-path` loads a specific checkpoint file
 
---checkpoint-path loads a specific checkpoint file
+### Weights & Biases logging (optional)
 
-W&B logging (optional)
+Enable experiment tracking with `--wandb` and related flags.
 
-Enable logging with --wandb and related flags.
+---
 
-🚧 Work in Progress
+## Work in Progress
 
-Status: This project is actively under development. Results and APIs may change as experiments evolve.
+This project is under active development. APIs, results, and defaults may change as experiments evolve.
 
 Planned improvements:
 
-Replace dummy bounding boxes with detector-based object regions
+* Replace dummy bounding boxes with detector-based object regions
+* Add systematic evaluation (e.g., linear probing, retrieval benchmarks)
+* Expand ablation studies (augmentations, temporal offsets, temperature, batch size, window size)
 
-Add systematic evaluation (e.g., linear probing / retrieval) and reporting
+---
 
-Expand ablations (augmentations, offsets, temperature, batch size, window size)
+## References
 
-📚 Cite / References
+If you use this repository for academic work, please cite the following:
 
-If you use this repository for academic work, please cite:
+**SimCLR**
+Chen, T., Kornblith, S., Norouzi, M., & Hinton, G. (2020). *A Simple Framework for Contrastive Learning of Visual Representations*. ICML.
 
-SimCLR: Chen, T., Kornblith, S., Norouzi, M., & Hinton, G. (2020). A Simple Framework for Contrastive Learning of Visual Representations. ICML.
+**Contrastive Learning Through Time (CLTT)**
+[https://openreview.net/forum?id=HTCRs8taN8](https://openreview.net/forum?id=HTCRs8taN8)
 
-CLTT / Contrastive Learning Through Time: ((https://openreview.net/forum?id=HTCRs8taN8))
+### BibTeX
 
-BibTeX
+```bibtex
 @inproceedings{chen2020simclr,
   title     = {A Simple Framework for Contrastive Learning of Visual Representations},
   author    = {Chen, Ting and Kornblith, Simon and Norouzi, Mohammad and Hinton, Geoffrey},
@@ -138,15 +194,10 @@ BibTeX
 }
 
 @misc{karanam2026clttbigred,
-  title        = {CLTT BigRed: Contrastive Learning Through Time for Egocentric Windows (Work in Progress)},
+  title        = {CLTT BigRed: Contrastive Learning Through Time for Egocentric Windows},
   author       = {Dheeraj Karanam},
   year         = {2026},
-  howpublished = {\\url{https://github.com/Dheeraj31104/cltt_bigred}},
+  howpublished = {\url{https://github.com/Dheeraj31104/cltt_bigred}},
   note         = {Work in progress}
 }
-
-Quick tip (so GitHub renders it nicely)
-
-Make sure the file name is exactly README.md and the content is not indented with 4 leading spaces on every line (that turns it into a code block).
-
-
+```
