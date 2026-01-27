@@ -16,9 +16,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torchvision import models
+from torchvision import datasets, models
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm.auto import tqdm
 
 from utils.EgocentricWindowDataset_new import EgocentricWindowDataset
@@ -43,6 +43,7 @@ class SimCLRResNet18(nn.Module):
         base.fc = nn.Identity()
 
         self.encoder = base
+        self.feature_dim = num_ftrs
         self.projection_head = nn.Sequential(
             nn.Linear(num_ftrs, num_ftrs),   # bias unchanged (default True)
             nn.BatchNorm1d(num_ftrs),
@@ -132,11 +133,150 @@ def resolve_device(preferred: str) -> torch.device:
 def build_transforms(image_size: int = 224) -> T.Compose:
     return T.Compose(
         [
-            T.Resize(256),
-            T.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+            T.Resize(image_size),
+            T.centerCrop(image_size),
             T.ToTensor(),
         ]
     )
+
+
+def _cifar_stats(name: str) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], int]:
+    if name == "cifar10":
+        mean = (0.4914, 0.4822, 0.4465)
+        std = (0.2470, 0.2435, 0.2616)
+        num_classes = 10
+    elif name == "cifar100":
+        mean = (0.5071, 0.4867, 0.4408)
+        std = (0.2675, 0.2565, 0.2761)
+        num_classes = 100
+    else:
+        raise ValueError(f"Unsupported CIFAR dataset: {name}")
+    return mean, std, num_classes
+
+
+def build_cifar_transforms(image_size: int, dataset_name: str) -> T.Compose:
+    mean, std, _ = _cifar_stats(dataset_name)
+    return T.Compose(
+        [
+            T.Resize(image_size),
+            T.ToTensor(),
+            T.Normalize(mean, std),
+        ]
+    )
+
+
+def linear_eval_on_cifar(
+    encoder: nn.Module,
+    feature_dim: int,
+    device: torch.device,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    eval_epochs: int,
+    lr: float,
+    weight_decay: float,
+    data_dir: str,
+    dataset_name: str = "cifar10",
+    download: bool = False,
+    max_batches: Optional[int] = None,
+) -> dict:
+    _, _, num_classes = _cifar_stats(dataset_name)
+    transform = build_cifar_transforms(image_size=image_size, dataset_name=dataset_name)
+    dataset_cls = datasets.CIFAR10 if dataset_name == "cifar10" else datasets.CIFAR100
+    try:
+        train_ds = dataset_cls(root=data_dir, train=True, transform=transform, download=download)
+        test_ds = dataset_cls(root=data_dir, train=False, transform=transform, download=download)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load {dataset_name} from {data_dir}. "
+            f"Set --cifar-download to fetch it if needed."
+        ) from exc
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    linear_head = nn.Linear(feature_dim, num_classes).to(device)
+    optimizer = torch.optim.SGD(linear_head.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    was_training = encoder.training
+    encoder.eval()
+    train_loss = 0.0
+    train_acc = 0.0
+    for _ in range(max(1, eval_epochs)):
+        linear_head.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        num_batches = 0
+        for b_idx, (x, y) in enumerate(train_loader):
+            if max_batches is not None and b_idx >= max_batches:
+                break
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            with torch.no_grad():
+                feats = encoder(x)
+            logits = linear_head(feats)
+            loss = criterion(logits, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            num_batches += 1
+            correct += (logits.argmax(dim=1) == y).sum().item()
+            total += y.size(0)
+
+        train_loss = running_loss / max(1, num_batches)
+        train_acc = correct / max(1, total)
+
+    linear_head.eval()
+    test_loss = 0.0
+    test_correct = 0
+    test_total = 0
+    num_batches = 0
+    with torch.no_grad():
+        for b_idx, (x, y) in enumerate(test_loader):
+            if max_batches is not None and b_idx >= max_batches:
+                break
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            feats = encoder(x)
+            logits = linear_head(feats)
+            loss = criterion(logits, y)
+
+            test_loss += loss.item()
+            num_batches += 1
+            test_correct += (logits.argmax(dim=1) == y).sum().item()
+            test_total += y.size(0)
+
+    test_loss = test_loss / max(1, num_batches)
+    test_acc = test_correct / max(1, test_total)
+
+    if was_training:
+        encoder.train()
+
+    return {
+        "train_loss": train_loss,
+        "train_acc": train_acc,
+        "test_loss": test_loss,
+        "test_acc": test_acc,
+        "num_classes": num_classes,
+    }
 
 
 def _find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
@@ -214,6 +354,7 @@ def train_simclr_from_buffer(
     lr: float = 1e-3,
     temperature: float = 0.5,
     proj_dim: int = 128,
+    image_size: int = 224,
     weight_decay: float = 1e-4,
     max_grad_norm: float = 1.0,
     checkpoint_dir: Optional[str] = None,
@@ -221,6 +362,15 @@ def train_simclr_from_buffer(
     checkpoint_path: Optional[str] = None,
     max_batches_per_epoch: Optional[int] = None,
     num_workers: int = 4,
+    linear_eval_every: int = 0,
+    linear_eval_epochs: int = 5,
+    linear_eval_batch_size: int = 256,
+    linear_eval_lr: float = 0.1,
+    linear_eval_weight_decay: float = 0.0,
+    linear_eval_max_batches: Optional[int] = None,
+    cifar_dataset: str = "cifar10",
+    cifar_data_dir: str = "data/cifar",
+    cifar_download: bool = False,
     wandb_run=None,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -373,6 +523,41 @@ def train_simclr_from_buffer(
                 step=epoch,
             )
 
+        if linear_eval_every and epoch % linear_eval_every == 0:
+            eval_metrics = linear_eval_on_cifar(
+                encoder=model.encoder,
+                feature_dim=model.feature_dim,
+                device=device,
+                image_size=image_size,
+                batch_size=linear_eval_batch_size,
+                num_workers=num_workers,
+                eval_epochs=linear_eval_epochs,
+                lr=linear_eval_lr,
+                weight_decay=linear_eval_weight_decay,
+                data_dir=cifar_data_dir,
+                dataset_name=cifar_dataset,
+                download=cifar_download,
+                max_batches=linear_eval_max_batches,
+            )
+            eval_metrics["epoch"] = epoch
+            history.setdefault("linear_eval", []).append(eval_metrics)
+            print(
+                "Linear eval @ epoch {epoch}: train_acc={train_acc:.4f}, "
+                "test_acc={test_acc:.4f}, train_loss={train_loss:.4f}, "
+                "test_loss={test_loss:.4f}".format(**eval_metrics)
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "linear_eval/train_loss": eval_metrics["train_loss"],
+                        "linear_eval/train_acc": eval_metrics["train_acc"],
+                        "linear_eval/test_loss": eval_metrics["test_loss"],
+                        "linear_eval/test_acc": eval_metrics["test_acc"],
+                        "linear_eval/epoch": epoch,
+                    },
+                    step=epoch,
+                )
+
         if checkpoint_dir is not None:
             ckpt_path = os.path.join(checkpoint_dir, f"simclr_epoch_{epoch:03d}.pth")
             torch.save(
@@ -435,6 +620,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-batches-per-epoch", type=int, default=None, help="Trim batches per epoch for faster sweeps.")
 
+    # Linear eval on CIFAR
+    parser.add_argument("--linear-eval-every", type=int, default=0, help="Run linear eval every N epochs (0 disables).")
+    parser.add_argument("--linear-eval-epochs", type=int, default=5, help="Epochs for the linear classifier.")
+    parser.add_argument("--linear-eval-batch-size", type=int, default=256)
+    parser.add_argument("--linear-eval-lr", type=float, default=0.1)
+    parser.add_argument("--linear-eval-weight-decay", type=float, default=0.0)
+    parser.add_argument("--linear-eval-max-batches", type=int, default=None, help="Trim batches in linear eval train/test.")
+    parser.add_argument("--cifar-dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
+    parser.add_argument("--cifar-data-dir", type=str, default="data/cifar")
+    parser.add_argument("--cifar-download", action="store_true", help="Download CIFAR if missing.")
+
     # Checkpointing
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory to save checkpoints.")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in checkpoint-dir.")
@@ -486,6 +682,7 @@ def main() -> None:
         lr=args.lr,
         temperature=args.temperature,
         proj_dim=args.proj_dim,
+        image_size=args.image_size,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
         checkpoint_dir=args.checkpoint_dir,
@@ -493,6 +690,15 @@ def main() -> None:
         checkpoint_path=args.checkpoint_path,
         max_batches_per_epoch=args.max_batches_per_epoch,
         num_workers=args.num_workers,
+        linear_eval_every=args.linear_eval_every,
+        linear_eval_epochs=args.linear_eval_epochs,
+        linear_eval_batch_size=args.linear_eval_batch_size,
+        linear_eval_lr=args.linear_eval_lr,
+        linear_eval_weight_decay=args.linear_eval_weight_decay,
+        linear_eval_max_batches=args.linear_eval_max_batches,
+        cifar_dataset=args.cifar_dataset,
+        cifar_data_dir=args.cifar_data_dir,
+        cifar_download=args.cifar_download,
         wandb_run=wandb_run,
     )
 
