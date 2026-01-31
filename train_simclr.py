@@ -9,101 +9,26 @@ run cleanly inside sbatch or job arrays.
 import argparse
 import os
 import random
-from typing import List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.transforms as T
-from torchvision import datasets, models
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from evaluation.cifar_linear_eval import linear_eval_on_cifar
+from losses.paired_cosine_tt import PairedCosineTTLoss
+from models.simclr_resnet import SimCLRResNet18
 from utils.EgocentricWindowDataset_new import EgocentricWindowDataset
 
 try:
     import wandb  # type: ignore
 except ImportError:
     wandb = None
-
-
-# -----------------------
-#    Model + Loss
-# -----------------------
-
-
-class SimCLRResNet18(nn.Module):
-    def __init__(self, proj_dim: int = 128):
-        super().__init__()
-
-        base = models.resnet18(weights=None)
-        num_ftrs = base.fc.in_features  # 512 for ResNet-18
-        base.fc = nn.Identity()
-
-        self.encoder = base
-        self.feature_dim = num_ftrs
-        self.projection_head = nn.Sequential(
-            nn.Linear(num_ftrs, num_ftrs),   # bias unchanged (default True)
-            nn.BatchNorm1d(num_ftrs),
-            nn.ReLU(inplace=True),
-            nn.Linear(num_ftrs, proj_dim),   # bias unchanged (default True)
-        )
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.encoder(x)             # (B, 512)
-        z = self.projection_head(h)     # (B, proj_dim)
-        return h, z
-
-class PairedCosineTTLoss(nn.Module):
-    """
-    Buffer contains consecutive positive pairs:
-      (0,1), (2,3), ..., (N-2, N-1)
-
-    For each anchor i:
-      numerator: exp(sim(i, pos(i))/tau)
-      denominator: sum_{k != i and k != pos(i)} exp(sim(i,k)/tau)
-    """
-    def __init__(self, temperature: float = 0.5, eps: float = 1e-8):
-        super().__init__()
-        self.temperature = temperature
-        self.eps = eps
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        z: (N, D) where N is even and ordered in positive pairs.
-        returns: scalar loss averaged over N anchors
-        """
-        if z.dim() != 2:
-            raise ValueError(f"Expected z to be (N, D), got {tuple(z.shape)}")
-        N, _ = z.shape
-        if N % 2 != 0:
-            raise ValueError(f"N must be even (pairs), got N={N}")
-
-        # cosine similarity via normalized dot product
-        z = F.normalize(z, dim=1, eps=self.eps)
-        sim = (z @ z.T) / self.temperature  # (N, N)
-
-        # pos index mapping for consecutive pairs: 0<->1, 2<->3, ...
-        idx = torch.arange(N, device=z.device)
-        pos_idx = idx ^ 1  # flips last bit: even->odd, odd->even
-
-        # positive logits: sim[i, pos(i)]
-        pos_logits = sim[idx, pos_idx]  # (N,)
-
-        # build mask for negatives: exclude self and exclude positive
-        neg_mask = torch.ones((N, N), dtype=torch.bool, device=z.device)
-        neg_mask.fill_diagonal_(False)                 # exclude self
-        neg_mask[idx, pos_idx] = False                 # exclude positive
-
-        # collect negatives per anchor: (N, N-2)
-        neg_logits = sim[neg_mask].view(N, N - 2)
-
-        # loss per anchor: -( pos - logsumexp(negs) )
-        loss_per = -(pos_logits - torch.logsumexp(neg_logits, dim=1))
-        return loss_per.mean()
-
 
 
 # -----------------------
@@ -134,153 +59,18 @@ def build_transforms(image_size: int = 224) -> T.Compose:
     return T.Compose(
         [
             T.Resize(image_size),
-            T.centerCrop(image_size),
+            T.CenterCrop(image_size),
             T.ToTensor(),
         ]
     )
-
-
-def _cifar_stats(name: str) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], int]:
-    if name == "cifar10":
-        mean = (0.4914, 0.4822, 0.4465)
-        std = (0.2470, 0.2435, 0.2616)
-        num_classes = 10
-    elif name == "cifar100":
-        mean = (0.5071, 0.4867, 0.4408)
-        std = (0.2675, 0.2565, 0.2761)
-        num_classes = 100
-    else:
-        raise ValueError(f"Unsupported CIFAR dataset: {name}")
-    return mean, std, num_classes
-
-
-def build_cifar_transforms(image_size: int, dataset_name: str) -> T.Compose:
-    mean, std, _ = _cifar_stats(dataset_name)
-    return T.Compose(
-        [
-            T.Resize(image_size),
-            T.ToTensor(),
-            T.Normalize(mean, std),
-        ]
-    )
-
-
-def linear_eval_on_cifar(
-    encoder: nn.Module,
-    feature_dim: int,
-    device: torch.device,
-    image_size: int,
-    batch_size: int,
-    num_workers: int,
-    eval_epochs: int,
-    lr: float,
-    weight_decay: float,
-    data_dir: str,
-    dataset_name: str = "cifar10",
-    download: bool = False,
-    max_batches: Optional[int] = None,
-) -> dict:
-    _, _, num_classes = _cifar_stats(dataset_name)
-    transform = build_cifar_transforms(image_size=image_size, dataset_name=dataset_name)
-    dataset_cls = datasets.CIFAR10 if dataset_name == "cifar10" else datasets.CIFAR100
-    try:
-        train_ds = dataset_cls(root=data_dir, train=True, transform=transform, download=download)
-        test_ds = dataset_cls(root=data_dir, train=False, transform=transform, download=download)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"Failed to load {dataset_name} from {data_dir}. "
-            f"Set --cifar-download to fetch it if needed."
-        ) from exc
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-    )
-
-    linear_head = nn.Linear(feature_dim, num_classes).to(device)
-    optimizer = torch.optim.SGD(linear_head.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
-    was_training = encoder.training
-    encoder.eval()
-    train_loss = 0.0
-    train_acc = 0.0
-    for _ in range(max(1, eval_epochs)):
-        linear_head.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        num_batches = 0
-        for b_idx, (x, y) in enumerate(train_loader):
-            if max_batches is not None and b_idx >= max_batches:
-                break
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            with torch.no_grad():
-                feats = encoder(x)
-            logits = linear_head(feats)
-            loss = criterion(logits, y)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            num_batches += 1
-            correct += (logits.argmax(dim=1) == y).sum().item()
-            total += y.size(0)
-
-        train_loss = running_loss / max(1, num_batches)
-        train_acc = correct / max(1, total)
-
-    linear_head.eval()
-    test_loss = 0.0
-    test_correct = 0
-    test_total = 0
-    num_batches = 0
-    with torch.no_grad():
-        for b_idx, (x, y) in enumerate(test_loader):
-            if max_batches is not None and b_idx >= max_batches:
-                break
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            feats = encoder(x)
-            logits = linear_head(feats)
-            loss = criterion(logits, y)
-
-            test_loss += loss.item()
-            num_batches += 1
-            test_correct += (logits.argmax(dim=1) == y).sum().item()
-            test_total += y.size(0)
-
-    test_loss = test_loss / max(1, num_batches)
-    test_acc = test_correct / max(1, test_total)
-
-    if was_training:
-        encoder.train()
-
-    return {
-        "train_loss": train_loss,
-        "train_acc": train_acc,
-        "test_loss": test_loss,
-        "test_acc": test_acc,
-        "num_classes": num_classes,
-    }
 
 
 def _find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
-    ckpts = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.startswith("simclr_epoch_")]
+    ckpts = [
+        os.path.join(checkpoint_dir, f)
+        for f in os.listdir(checkpoint_dir)
+        if f.startswith("simclr_epoch_")
+    ]
     if not ckpts:
         return None
 
@@ -308,7 +98,6 @@ def _prepare_views(
     """
     if isinstance(batch, (list, tuple)):
         v0, v1 = batch
-        # If dataset returns window stacks, select first/last frame.
         if v0.dim() == 5:
             v0 = v0[:, 0]
             v1 = v1[:, -1]
@@ -343,8 +132,319 @@ def _init_wandb(args: argparse.Namespace):
 
 
 # -----------------------
-#    Training
+#    Config + Trainer
 # -----------------------
+@dataclass
+class LinearEvalConfig:
+    every: int
+    epochs: int
+    batch_size: int
+    lr: float
+    weight_decay: float
+    max_batches: Optional[int]
+    train_fraction: float
+    split_seed: int
+    dataset: str
+    data_dir: str
+    download: bool
+
+
+class SimCLRTrainer:
+    """Object-oriented trainer for SimCLR with optional CIFAR linear eval."""
+
+    def __init__(
+        self,
+        dataset,
+        device: torch.device,
+        epochs: int = 10,
+        batch_size: int = 32,
+        sub_batch_size: Optional[int] = None,
+        lr: float = 1e-3,
+        temperature: float = 0.5,
+        proj_dim: int = 128,
+        image_size: int = 224,
+        weight_decay: float = 1e-4,
+        max_grad_norm: Optional[float] = 1.0,
+        checkpoint_dir: Optional[str] = None,
+        resume: bool = False,
+        checkpoint_path: Optional[str] = None,
+        max_batches_per_epoch: Optional[int] = None,
+        num_workers: int = 4,
+        linear_eval: Optional[LinearEvalConfig] = None,
+        wandb_run=None,
+    ) -> None:
+        self.dataset = dataset
+        self.device = device
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.sub_batch_size = sub_batch_size
+        self.lr = lr
+        self.temperature = temperature
+        self.proj_dim = proj_dim
+        self.image_size = image_size
+        self.weight_decay = weight_decay
+        self.max_grad_norm = max_grad_norm
+        self.checkpoint_dir = checkpoint_dir
+        self.resume = resume
+        self.checkpoint_path = checkpoint_path
+        self.max_batches_per_epoch = max_batches_per_epoch
+        self.num_workers = num_workers
+        self.linear_eval = linear_eval
+        self.wandb_run = wandb_run
+
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.device.type == "cuda",
+        )
+
+        self.model = SimCLRResNet18(proj_dim=self.proj_dim).to(self.device)
+        self.criterion = PairedCosineTTLoss(temperature=self.temperature)
+        self.optimizer = torch.optim.Adam(
+            [
+                {"params": self.model.encoder.parameters(), "lr": self.lr},
+                {"params": self.model.projection_head.parameters(), "lr": self.lr},
+            ],
+            weight_decay=self.weight_decay,
+        )
+
+        self.start_epoch = 1
+        self.history = {"epoch_loss": []}
+        self.scheduler_state_dict = None
+        self.global_step = 0
+
+        if self.checkpoint_dir is not None:
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        self._maybe_resume()
+        self.scheduler = self._build_scheduler()
+        if self.scheduler_state_dict is not None:
+            self.scheduler.load_state_dict(self.scheduler_state_dict)
+
+    def _build_scheduler(self) -> torch.optim.lr_scheduler.CosineAnnealingLR:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.epochs,
+            last_epoch=self.start_epoch - 2,
+        )
+
+    def _maybe_resume(self) -> None:
+        if not self.resume:
+            return
+
+        checkpoint_path = self.checkpoint_path
+        if checkpoint_path is None and self.checkpoint_dir is not None:
+            checkpoint_path = _find_latest_checkpoint(self.checkpoint_dir)
+
+        if checkpoint_path is None or not os.path.isfile(checkpoint_path):
+            print("[WARN] resume enabled but checkpoint not found; starting fresh.")
+            return
+
+        print(f"[INFO] Resuming from checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.start_epoch = ckpt.get("epoch", 0) + 1
+        self.history = ckpt.get("history", {"epoch_loss": []})
+        self.scheduler_state_dict = ckpt.get("scheduler_state_dict")
+        self.global_step = ckpt.get("global_step", 0)
+
+    def _train_batch(self, v0: torch.Tensor, v1: torch.Tensor) -> Tuple[float, Optional[float]]:
+        bsz = v0.size(0)
+        grad_norm = None
+
+        if self.sub_batch_size is None or self.sub_batch_size >= bsz:
+            x = torch.cat([v0, v1], dim=0)
+            _, z = self.model(x)
+            z1, z2 = torch.chunk(z, 2, dim=0)
+
+            z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
+            loss = self.criterion(z_pairs)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.max_grad_norm is not None:
+                grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm).item()
+            self.optimizer.step()
+
+            return loss.item(), grad_norm
+
+        self.optimizer.zero_grad()
+        total_loss = 0.0
+        for start in range(0, bsz, self.sub_batch_size):
+            end = min(start + self.sub_batch_size, bsz)
+            sub_v0 = v0[start:end]
+            sub_v1 = v1[start:end]
+            sub_b = sub_v0.size(0)
+
+            x = torch.cat([sub_v0, sub_v1], dim=0)
+            _, z = self.model(x)
+            z1, z2 = torch.chunk(z, 2, dim=0)
+
+            z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
+            loss_sub = self.criterion(z_pairs)
+
+            loss_scaled = loss_sub * (sub_b / bsz)
+            loss_scaled.backward()
+            total_loss += loss_sub.item() * (sub_b / bsz)
+
+        if self.max_grad_norm is not None:
+            grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm).item()
+        self.optimizer.step()
+
+        return total_loss, grad_norm
+
+    def _train_epoch(self, epoch: int) -> Tuple[float, int]:
+        self.model.train()
+        running_loss = 0.0
+        num_batches = 0
+
+        pbar = tqdm(self.loader, desc=f"Epoch {epoch}/{self.epochs}", leave=False)
+        for b_idx, batch in enumerate(pbar):
+            if self.max_batches_per_epoch is not None and b_idx >= self.max_batches_per_epoch:
+                break
+
+            v0, v1 = _prepare_views(batch, self.device)
+            batch_loss_value, grad_norm = self._train_batch(v0, v1)
+
+            running_loss += batch_loss_value
+            num_batches += 1
+            self.global_step += 1
+            pbar.set_postfix(loss=batch_loss_value)
+
+            if self.wandb_run is not None:
+                log_payload = {
+                    "train/loss_batch": batch_loss_value,
+                    "train/epoch": epoch,
+                    "train/global_step": self.global_step,
+                }
+                if grad_norm is not None:
+                    log_payload["train/grad_norm"] = grad_norm
+                self.wandb_run.log(log_payload, step=self.global_step)
+
+        epoch_loss = running_loss / max(1, num_batches)
+        return epoch_loss, num_batches
+
+    def _run_linear_eval(self, epoch: int) -> None:
+        if self.linear_eval is None:
+            return
+        if not self.linear_eval.every or epoch % self.linear_eval.every != 0:
+            return
+
+        eval_metrics = linear_eval_on_cifar(
+            encoder=self.model.encoder,
+            feature_dim=self.model.feature_dim,
+            device=self.device,
+            image_size=self.image_size,
+            batch_size=self.linear_eval.batch_size,
+            num_workers=self.num_workers,
+            eval_epochs=self.linear_eval.epochs,
+            lr=self.linear_eval.lr,
+            weight_decay=self.linear_eval.weight_decay,
+            data_dir=self.linear_eval.data_dir,
+            dataset_name=self.linear_eval.dataset,
+            download=self.linear_eval.download,
+            train_fraction=self.linear_eval.train_fraction,
+            split_seed=self.linear_eval.split_seed,
+            max_batches=self.linear_eval.max_batches,
+        )
+        eval_metrics["epoch"] = epoch
+        self.history.setdefault("linear_eval", []).append(eval_metrics)
+
+        print(
+            "Linear eval @ epoch {epoch}: train_acc={train_acc:.4f}, "
+            "val_acc={val_acc:.4f}, test_acc={test_acc:.4f}, "
+            "train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
+            "test_loss={test_loss:.4f}".format(**eval_metrics)
+        )
+
+        if self.wandb_run is not None:
+            self.wandb_run.log(
+                {
+                    "linear_eval/train_loss": eval_metrics["train_loss"],
+                    "linear_eval/train_acc": eval_metrics["train_acc"],
+                    "linear_eval/val_loss": eval_metrics["val_loss"],
+                    "linear_eval/val_acc": eval_metrics["val_acc"],
+                    "linear_eval/test_loss": eval_metrics["test_loss"],
+                    "linear_eval/test_acc": eval_metrics["test_acc"],
+                    "linear_eval/epoch": epoch,
+                },
+                step=epoch,
+            )
+
+    def _save_checkpoint(self, epoch: int) -> None:
+        if self.checkpoint_dir is None:
+            return
+
+        ckpt_path = os.path.join(self.checkpoint_dir, f"simclr_epoch_{epoch:03d}.pth")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "proj_dim": self.proj_dim,
+                "backbone": "resnet18",
+                "history": self.history,
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "global_step": self.global_step,
+            },
+            ckpt_path,
+        )
+        print(f"Saved checkpoint: {ckpt_path}")
+
+    def _save_final(self) -> None:
+        if self.checkpoint_dir is None:
+            return
+
+        final_path = os.path.join(self.checkpoint_dir, "simclr_final.pth")
+        torch.save(
+            {
+                "epoch": self.epochs,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "proj_dim": self.proj_dim,
+                "backbone": "resnet18",
+                "history": self.history,
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "global_step": self.global_step,
+            },
+            final_path,
+        )
+        print(f"Saved final model: {final_path}")
+
+    def fit(self) -> Tuple[nn.Module, dict]:
+        for epoch in range(self.start_epoch, self.epochs + 1):
+            epoch_loss, num_batches = self._train_epoch(epoch)
+
+            self.scheduler.step()
+            self.history["epoch_loss"].append(epoch_loss)
+
+            lr_now = self.scheduler.get_last_lr()[0]
+            print(
+                f"Epoch {epoch}/{self.epochs} - mean loss: {epoch_loss:.4f} "
+                f"- lr: {lr_now:.2e} - batches: {num_batches}"
+            )
+
+            if self.wandb_run is not None:
+                self.wandb_run.log(
+                    {
+                        "train/loss_epoch": epoch_loss,
+                        "train/lr": lr_now,
+                        "train/batches": num_batches,
+                        "train/epoch": epoch,
+                    },
+                    step=epoch,
+                )
+
+            self._run_linear_eval(epoch)
+            self._save_checkpoint(epoch)
+
+        self._save_final()
+        return self.model, self.history
+
+
 def train_simclr_from_buffer(
     dataset,
     device: torch.device,
@@ -356,7 +456,7 @@ def train_simclr_from_buffer(
     proj_dim: int = 128,
     image_size: int = 224,
     weight_decay: float = 1e-4,
-    max_grad_norm: float = 1.0,
+    max_grad_norm: Optional[float] = 1.0,
     checkpoint_dir: Optional[str] = None,
     resume: bool = False,
     checkpoint_path: Optional[str] = None,
@@ -368,231 +468,48 @@ def train_simclr_from_buffer(
     linear_eval_lr: float = 0.1,
     linear_eval_weight_decay: float = 0.0,
     linear_eval_max_batches: Optional[int] = None,
+    linear_eval_train_fraction: float = 0.7,
+    linear_eval_split_seed: int = 42,
     cifar_dataset: str = "cifar10",
     cifar_data_dir: str = "data/cifar",
     cifar_download: bool = False,
     wandb_run=None,
 ) -> Tuple[nn.Module, dict]:
-    """
-    Train SimCLR (ResNet50 + projection head) on a temporal buffer dataset.
-    """
-    loader = DataLoader(
-        dataset,
+    linear_eval_cfg = LinearEvalConfig(
+        every=linear_eval_every,
+        epochs=linear_eval_epochs,
+        batch_size=linear_eval_batch_size,
+        lr=linear_eval_lr,
+        weight_decay=linear_eval_weight_decay,
+        max_batches=linear_eval_max_batches,
+        train_fraction=linear_eval_train_fraction,
+        split_seed=linear_eval_split_seed,
+        dataset=cifar_dataset,
+        data_dir=cifar_data_dir,
+        download=cifar_download,
+    )
+
+    trainer = SimCLRTrainer(
+        dataset=dataset,
+        device=device,
+        epochs=epochs,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-    )
-
-    model = SimCLRResNet18(proj_dim=proj_dim).to(device)
-    criterion = PairedCosineTTLoss(temperature=temperature)
-
-    optimizer = torch.optim.Adam(
-        [
-            {"params": model.encoder.parameters(), "lr": lr},
-            {"params": model.projection_head.parameters(), "lr": lr},
-        ],
+        sub_batch_size=sub_batch_size,
+        lr=lr,
+        temperature=temperature,
+        proj_dim=proj_dim,
+        image_size=image_size,
         weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+        checkpoint_path=checkpoint_path,
+        max_batches_per_epoch=max_batches_per_epoch,
+        num_workers=num_workers,
+        linear_eval=linear_eval_cfg,
+        wandb_run=wandb_run,
     )
-
-    start_epoch = 1
-    history = {"epoch_loss": []}
-    scheduler_state_dict = None
-    global_step = 0
-
-    if checkpoint_dir is not None:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-    if resume:
-        if checkpoint_path is None and checkpoint_dir is not None:
-            checkpoint_path = _find_latest_checkpoint(checkpoint_dir)
-
-        if checkpoint_path is not None and os.path.isfile(checkpoint_path):
-            print(f"[INFO] Resuming from checkpoint: {checkpoint_path}")
-            ckpt = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            start_epoch = ckpt.get("epoch", 0) + 1
-            history = ckpt.get("history", {"epoch_loss": []})
-            scheduler_state_dict = ckpt.get("scheduler_state_dict")
-            global_step = ckpt.get("global_step", 0)
-        else:
-            print("[WARN] resume enabled but checkpoint not found; starting fresh.")
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,
-        last_epoch=start_epoch - 2,  # step() will move to start_epoch-1
-    )
-    if scheduler_state_dict is not None:
-        scheduler.load_state_dict(scheduler_state_dict)
-
-    for epoch in range(start_epoch, epochs + 1):
-        model.train()
-        running_loss = 0.0
-        num_batches = 0
-
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
-
-        for b_idx, batch in enumerate(pbar):
-            if max_batches_per_epoch is not None and b_idx >= max_batches_per_epoch:
-                break
-
-            v0, v1 = _prepare_views(batch, device)
-            bsz = v0.size(0)
-
-            grad_norm = None
-
-            if sub_batch_size is None or sub_batch_size >= bsz:
-                x = torch.cat([v0, v1], dim=0)
-                _, z = model(x)
-                z1, z2 = torch.chunk(z, 2, dim=0)  
-                           
-
-                # interleave: [z1_0, z2_0, z1_1, z2_1, ...] -> (2B, D)
-                z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
-
-                loss = criterion(z_pairs)  # <-- loss expects single tensor
-
-                optimizer.zero_grad()
-                loss.backward()
-                if max_grad_norm is not None:
-                    grad_norm = clip_grad_norm_(model.parameters(), max_grad_norm).item()
-                optimizer.step()
-
-                batch_loss_value = loss.item()
-            else:
-                optimizer.zero_grad()
-                total_loss = 0.0
-                for start in range(0, bsz, sub_batch_size):
-                    end = min(start + sub_batch_size, bsz)
-                    sub_v0 = v0[start:end]
-                    sub_v1 = v1[start:end]
-                    sub_b = sub_v0.size(0)
-
-                    x = torch.cat([sub_v0, sub_v1], dim=0)
-                    _, z = model(x)
-                    z1, z2 = torch.chunk(z, 2, dim=0)
-
-                    z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
-                    loss_sub = criterion(z_pairs)
-
-                    loss_scaled = loss_sub * (sub_b / bsz)
-                    loss_scaled.backward()
-                    total_loss += loss_sub.item() * (sub_b / bsz)
-
-                if max_grad_norm is not None:
-                    grad_norm = clip_grad_norm_(model.parameters(), max_grad_norm).item()
-                optimizer.step()
-
-                batch_loss_value = total_loss
-
-            running_loss += batch_loss_value
-            num_batches += 1
-            global_step += 1
-            pbar.set_postfix(loss=batch_loss_value)
-
-            if wandb_run is not None:
-                log_payload = {
-                    "train/loss_batch": batch_loss_value,
-                    "train/epoch": epoch,
-                    "train/global_step": global_step,
-                }
-                if grad_norm is not None:
-                    log_payload["train/grad_norm"] = grad_norm
-                wandb_run.log(log_payload, step=global_step)
-
-        scheduler.step()
-        epoch_loss = running_loss / max(1, num_batches)
-        history["epoch_loss"].append(epoch_loss)
-
-        lr_now = scheduler.get_last_lr()[0]
-        print(
-            f"Epoch {epoch}/{epochs} - mean loss: {epoch_loss:.4f} "
-            f"- lr: {lr_now:.2e} - batches: {num_batches}"
-        )
-
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "train/loss_epoch": epoch_loss,
-                    "train/lr": lr_now,
-                    "train/batches": num_batches,
-                    "train/epoch": epoch,
-                },
-                step=epoch,
-            )
-
-        if linear_eval_every and epoch % linear_eval_every == 0:
-            eval_metrics = linear_eval_on_cifar(
-                encoder=model.encoder,
-                feature_dim=model.feature_dim,
-                device=device,
-                image_size=image_size,
-                batch_size=linear_eval_batch_size,
-                num_workers=num_workers,
-                eval_epochs=linear_eval_epochs,
-                lr=linear_eval_lr,
-                weight_decay=linear_eval_weight_decay,
-                data_dir=cifar_data_dir,
-                dataset_name=cifar_dataset,
-                download=cifar_download,
-                max_batches=linear_eval_max_batches,
-            )
-            eval_metrics["epoch"] = epoch
-            history.setdefault("linear_eval", []).append(eval_metrics)
-            print(
-                "Linear eval @ epoch {epoch}: train_acc={train_acc:.4f}, "
-                "test_acc={test_acc:.4f}, train_loss={train_loss:.4f}, "
-                "test_loss={test_loss:.4f}".format(**eval_metrics)
-            )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "linear_eval/train_loss": eval_metrics["train_loss"],
-                        "linear_eval/train_acc": eval_metrics["train_acc"],
-                        "linear_eval/test_loss": eval_metrics["test_loss"],
-                        "linear_eval/test_acc": eval_metrics["test_acc"],
-                        "linear_eval/epoch": epoch,
-                    },
-                    step=epoch,
-                )
-
-        if checkpoint_dir is not None:
-            ckpt_path = os.path.join(checkpoint_dir, f"simclr_epoch_{epoch:03d}.pth")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "proj_dim": proj_dim,
-                    "backbone": "resnet18",
-                    "history": history,
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "global_step": global_step,
-                },
-                ckpt_path,
-            )
-            print(f"Saved checkpoint: {ckpt_path}")
-
-    if checkpoint_dir is not None:
-        final_path = os.path.join(checkpoint_dir, "simclr_final.pth")
-        torch.save(
-            {
-                "epoch": epochs,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "proj_dim": proj_dim,
-                "backbone": "resnet18",
-                "history": history,
-                "scheduler_state_dict": scheduler.state_dict(),
-                "global_step": global_step,
-            },
-            final_path,
-        )
-        print(f"Saved final model: {final_path}")
-
-    return model, history
+    return trainer.fit()
 
 
 # -----------------------
@@ -627,6 +544,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linear-eval-lr", type=float, default=0.1)
     parser.add_argument("--linear-eval-weight-decay", type=float, default=0.0)
     parser.add_argument("--linear-eval-max-batches", type=int, default=None, help="Trim batches in linear eval train/test.")
+    parser.add_argument(
+        "--linear-eval-train-fraction",
+        type=float,
+        default=0.7,
+        help="Fraction of CIFAR train split used to fit the linear head (rest is validation).",
+    )
+    parser.add_argument(
+        "--linear-eval-split-seed",
+        type=int,
+        default=42,
+        help="Seed for the CIFAR train/validation split used during linear eval.",
+    )
     parser.add_argument("--cifar-dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
     parser.add_argument("--cifar-data-dir", type=str, default="data/cifar")
     parser.add_argument("--cifar-download", action="store_true", help="Download CIFAR if missing.")
@@ -663,7 +592,7 @@ def main() -> None:
         root_dir=args.root_dir,
         window_size=args.window_size,
         frame_step=args.frame_step,
-        transform=transform,    
+        transform=transform,
         return_stack=True,
         verbose=True,
         use_object_focus=args.use_object_focus,
@@ -696,6 +625,8 @@ def main() -> None:
         linear_eval_lr=args.linear_eval_lr,
         linear_eval_weight_decay=args.linear_eval_weight_decay,
         linear_eval_max_batches=args.linear_eval_max_batches,
+        linear_eval_train_fraction=args.linear_eval_train_fraction,
+        linear_eval_split_seed=args.linear_eval_split_seed,
         cifar_dataset=args.cifar_dataset,
         cifar_data_dir=args.cifar_data_dir,
         cifar_download=args.cifar_download,
