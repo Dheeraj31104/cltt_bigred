@@ -7,10 +7,11 @@ run cleanly inside sbatch or job arrays.
 """
 
 import argparse
+import csv
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
+from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -24,11 +25,6 @@ from evaluation.cifar_linear_eval import linear_eval_on_cifar
 from losses.paired_cosine_tt import PairedCosineTTLoss
 from models.simclr_resnet import SimCLRResNet18
 from utils.EgocentricWindowDataset_new import EgocentricWindowDataset
-
-try:
-    import wandb  # type: ignore
-except ImportError:
-    wandb = None
 
 
 # -----------------------
@@ -107,28 +103,85 @@ def _prepare_views(
     return batch[:, 0], batch[:, -1]
 
 
-def _init_wandb(args: argparse.Namespace):
-    """
-    Initialize wandb if requested and available.
-    Returns wandb.run or None.
-    """
-    if not getattr(args, "wandb", False):
-        return None
-    if wandb is None:
-        print("[WARN] wandb requested but not installed; continuing without logging.")
+def _coerce_metric_value(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _infer_epoch(metrics: Mapping[str, object]) -> Optional[int]:
+    for key in ("train/epoch", "linear_eval/epoch", "epoch"):
+        if key in metrics:
+            try:
+                return int(metrics[key])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+class CSVLogger:
+    def __init__(self, path: str, append: bool = True) -> None:
+        self.path = path
+        log_dir = os.path.dirname(path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        file_exists = os.path.isfile(path)
+        file_has_content = file_exists and os.path.getsize(path) > 0
+        mode = "a" if append else "w"
+        self._file = open(path, mode, newline="")
+        self._writer = csv.writer(self._file)
+        if not append or not file_has_content:
+            self._writer.writerow(["step", "epoch", "key", "value"])
+            self._file.flush()
+
+    def log(self, metrics: Mapping[str, object], step: Optional[int] = None, epoch: Optional[int] = None) -> None:
+        if epoch is None:
+            epoch = _infer_epoch(metrics)
+        for key, value in metrics.items():
+            self._writer.writerow([step, epoch, key, _coerce_metric_value(value)])
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def _resolve_resume_checkpoint(args: argparse.Namespace) -> Optional[str]:
+    if not getattr(args, "resume", False):
         return None
 
-    tags = args.wandb_tags.split(",") if args.wandb_tags else []
-    tags = [t for t in tags if t]
-    run = wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_name,
-        tags=tags,
-        mode=args.wandb_mode,
-        config=vars(args),
-    )
-    return run
+    checkpoint_path = args.checkpoint_path
+    if checkpoint_path is None and args.checkpoint_dir is not None:
+        checkpoint_path = _find_latest_checkpoint(args.checkpoint_dir)
+
+    if checkpoint_path is None or not os.path.isfile(checkpoint_path):
+        return None
+    return checkpoint_path
+
+
+def _init_csv_logger(args: argparse.Namespace) -> Optional[CSVLogger]:
+    if not getattr(args, "csv_log", False):
+        return None
+
+    log_path = args.csv_log_path
+    if not log_path:
+        if args.checkpoint_dir:
+            log_path = os.path.join(args.checkpoint_dir, "metrics.csv")
+        else:
+            log_path = os.path.join("logs", "simclr_metrics.csv")
+
+    resume_ckpt = _resolve_resume_checkpoint(args)
+    append = resume_ckpt is not None
+    if not append and os.path.isfile(log_path) and os.path.getsize(log_path) > 0:
+        print(f"[INFO] Fresh run detected; overwriting existing CSV at {log_path}")
+    elif append and not os.path.isfile(log_path):
+        print(f"[WARN] Resume requested but CSV log not found; creating new file at {log_path}")
+
+    print(f"[INFO] CSV logging to {log_path}")
+    return CSVLogger(log_path, append=append)
 
 
 # -----------------------
@@ -171,7 +224,7 @@ class SimCLRTrainer:
         max_batches_per_epoch: Optional[int] = None,
         num_workers: int = 4,
         linear_eval: Optional[LinearEvalConfig] = None,
-        wandb_run=None,
+        csv_logger: Optional[CSVLogger] = None,
     ) -> None:
         self.dataset = dataset
         self.device = device
@@ -190,7 +243,7 @@ class SimCLRTrainer:
         self.max_batches_per_epoch = max_batches_per_epoch
         self.num_workers = num_workers
         self.linear_eval = linear_eval
-        self.wandb_run = wandb_run
+        self.csv_logger = csv_logger
 
         self.loader = DataLoader(
             self.dataset,
@@ -314,7 +367,7 @@ class SimCLRTrainer:
             self.global_step += 1
             pbar.set_postfix(loss=batch_loss_value)
 
-            if self.wandb_run is not None:
+            if self.csv_logger is not None:
                 log_payload = {
                     "train/loss_batch": batch_loss_value,
                     "train/epoch": epoch,
@@ -322,7 +375,7 @@ class SimCLRTrainer:
                 }
                 if grad_norm is not None:
                     log_payload["train/grad_norm"] = grad_norm
-                self.wandb_run.log(log_payload, step=self.global_step)
+                self.csv_logger.log(log_payload, step=self.global_step, epoch=epoch)
 
         epoch_loss = running_loss / max(1, num_batches)
         return epoch_loss, num_batches
@@ -360,8 +413,8 @@ class SimCLRTrainer:
             "test_loss={test_loss:.4f}".format(**eval_metrics)
         )
 
-        if self.wandb_run is not None:
-            self.wandb_run.log(
+        if self.csv_logger is not None:
+            self.csv_logger.log(
                 {
                     "linear_eval/train_loss": eval_metrics["train_loss"],
                     "linear_eval/train_acc": eval_metrics["train_acc"],
@@ -372,6 +425,7 @@ class SimCLRTrainer:
                     "linear_eval/epoch": epoch,
                 },
                 step=epoch,
+                epoch=epoch,
             )
 
     def _save_checkpoint(self, epoch: int) -> None:
@@ -427,8 +481,8 @@ class SimCLRTrainer:
                 f"- lr: {lr_now:.2e} - batches: {num_batches}"
             )
 
-            if self.wandb_run is not None:
-                self.wandb_run.log(
+            if self.csv_logger is not None:
+                self.csv_logger.log(
                     {
                         "train/loss_epoch": epoch_loss,
                         "train/lr": lr_now,
@@ -436,6 +490,7 @@ class SimCLRTrainer:
                         "train/epoch": epoch,
                     },
                     step=epoch,
+                    epoch=epoch,
                 )
 
             self._run_linear_eval(epoch)
@@ -473,7 +528,7 @@ def train_simclr_from_buffer(
     cifar_dataset: str = "cifar10",
     cifar_data_dir: str = "data/cifar",
     cifar_download: bool = False,
-    wandb_run=None,
+    csv_logger: Optional[CSVLogger] = None,
 ) -> Tuple[nn.Module, dict]:
     linear_eval_cfg = LinearEvalConfig(
         every=linear_eval_every,
@@ -507,7 +562,7 @@ def train_simclr_from_buffer(
         max_batches_per_epoch=max_batches_per_epoch,
         num_workers=num_workers,
         linear_eval=linear_eval_cfg,
-        wandb_run=wandb_run,
+        csv_logger=csv_logger,
     )
     return trainer.fit()
 
@@ -569,13 +624,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", help="cuda|cpu|mps|auto")
     parser.add_argument("--seed", type=int, default=42)
 
-    # wandb
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
-    parser.add_argument("--wandb-project", type=str, default="simclr-ego", help="wandb project name.")
-    parser.add_argument("--wandb-entity", type=str, default=None, help="wandb entity/org (optional).")
-    parser.add_argument("--wandb-name", type=str, default=None, help="wandb run name.")
-    parser.add_argument("--wandb-tags", type=str, default="", help="Comma-separated wandb tags.")
-    parser.add_argument("--wandb-mode", type=str, default="online", help="wandb mode: online|offline|disabled.")
+    # CSV logging
+    parser.add_argument("--csv-log", action="store_true", help="Enable CSV logging.")
+    parser.add_argument(
+        "--csv-log-path",
+        type=str,
+        default=None,
+        help="Path to CSV log file (defaults to checkpoint dir if set).",
+    )
 
     return parser.parse_args()
 
@@ -584,7 +640,7 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
-    wandb_run = _init_wandb(args)
+    csv_logger = _init_csv_logger(args)
 
     transform = build_transforms(image_size=args.image_size)
 
@@ -602,36 +658,40 @@ def main() -> None:
     if len(dataset) == 0:
         raise RuntimeError(f"No samples found under {args.root_dir}. Check path or window parameters.")
 
-    train_simclr_from_buffer(
-        dataset=dataset,
-        device=device,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        sub_batch_size=args.sub_batch_size,
-        lr=args.lr,
-        temperature=args.temperature,
-        proj_dim=args.proj_dim,
-        image_size=args.image_size,
-        weight_decay=args.weight_decay,
-        max_grad_norm=args.max_grad_norm,
-        checkpoint_dir=args.checkpoint_dir,
-        resume=args.resume,
-        checkpoint_path=args.checkpoint_path,
-        max_batches_per_epoch=args.max_batches_per_epoch,
-        num_workers=args.num_workers,
-        linear_eval_every=args.linear_eval_every,
-        linear_eval_epochs=args.linear_eval_epochs,
-        linear_eval_batch_size=args.linear_eval_batch_size,
-        linear_eval_lr=args.linear_eval_lr,
-        linear_eval_weight_decay=args.linear_eval_weight_decay,
-        linear_eval_max_batches=args.linear_eval_max_batches,
-        linear_eval_train_fraction=args.linear_eval_train_fraction,
-        linear_eval_split_seed=args.linear_eval_split_seed,
-        cifar_dataset=args.cifar_dataset,
-        cifar_data_dir=args.cifar_data_dir,
-        cifar_download=args.cifar_download,
-        wandb_run=wandb_run,
-    )
+    try:
+        train_simclr_from_buffer(
+            dataset=dataset,
+            device=device,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            sub_batch_size=args.sub_batch_size,
+            lr=args.lr,
+            temperature=args.temperature,
+            proj_dim=args.proj_dim,
+            image_size=args.image_size,
+            weight_decay=args.weight_decay,
+            max_grad_norm=args.max_grad_norm,
+            checkpoint_dir=args.checkpoint_dir,
+            resume=args.resume,
+            checkpoint_path=args.checkpoint_path,
+            max_batches_per_epoch=args.max_batches_per_epoch,
+            num_workers=args.num_workers,
+            linear_eval_every=args.linear_eval_every,
+            linear_eval_epochs=args.linear_eval_epochs,
+            linear_eval_batch_size=args.linear_eval_batch_size,
+            linear_eval_lr=args.linear_eval_lr,
+            linear_eval_weight_decay=args.linear_eval_weight_decay,
+            linear_eval_max_batches=args.linear_eval_max_batches,
+            linear_eval_train_fraction=args.linear_eval_train_fraction,
+            linear_eval_split_seed=args.linear_eval_split_seed,
+            cifar_dataset=args.cifar_dataset,
+            cifar_data_dir=args.cifar_data_dir,
+            cifar_download=args.cifar_download,
+            csv_logger=csv_logger,
+        )
+    finally:
+        if csv_logger is not None:
+            csv_logger.close()
 
 
 if __name__ == "__main__":

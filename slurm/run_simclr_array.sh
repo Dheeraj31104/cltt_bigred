@@ -8,7 +8,7 @@
 #SBATCH --job-name=simclr_ego
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=6:00:00
 #SBATCH --output=logs/simclr_%A_%a.out
 #SBATCH --mail-user=dhkara@iu.edu
@@ -55,12 +55,8 @@ CIFAR_DATASET="cifar10"
 CIFAR_DATA_DIR="$PWD/data/cifar"
 CIFAR_DOWNLOAD=0
 
-# Weights & Biases
-ENABLE_WANDB=1                                              # set to 1 to enable wandb logging
-WANDB_PROJECT="simclr-ego-sruns"
-WANDB_ENTITY=""                                             # optional
-WANDB_MODE="online"                                         # online|offline|disabled
-WANDB_TAGS="slurm,simclr"
+# CSV logging
+ENABLE_CSV_LOG=1                                            # set to 1 to enable CSV logging
 
 # Optional env bootstrap (module/conda/etc). Uncomment and edit for your cluster.
 # module load cuda/12.1
@@ -162,12 +158,9 @@ if [[ "${LINEAR_EVAL_EVERY}" -gt 0 ]]; then
   [[ "${CIFAR_DOWNLOAD}" == "1" ]] && EXTRA_ARGS+=(--cifar-download)
 fi
 
-# wandb configuration
-if [[ "${ENABLE_WANDB}" == "1" ]]; then
-  EXTRA_ARGS+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-mode "$WANDB_MODE")
-  [[ -n "${WANDB_ENTITY}" ]] && EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY")
-  [[ -n "${WANDB_TAGS}" ]] && EXTRA_ARGS+=(--wandb-tags "$WANDB_TAGS")
-  EXTRA_ARGS+=(--wandb-name "${RUN_NAME}")
+# CSV logging configuration
+if [[ "${ENABLE_CSV_LOG}" == "1" ]]; then
+  EXTRA_ARGS+=(--csv-log --csv-log-path "${CKPT_DIR}/metrics.csv")
 fi
 
 echo "Starting run ${RUN_NAME}"
