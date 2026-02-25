@@ -23,7 +23,7 @@ ROOT_DIR="/N/project/cogai/dhkara/cropped_clips"          # folder with extracte
 CHECKPOINT_ROOT="$PWD/checkpoints"                        # base output dir for checkpoints
 
 # Core training settings
-EPOCHS=100
+EPOCHS=25
 IMAGE_SIZE=224
 BATCH_SIZE_DEFAULT=256
 LR_DEFAULT=1e-3
@@ -39,11 +39,14 @@ MAX_BATCHES_PER_EPOCH=""                                  # set to e.g. 500 to c
 NUM_WORKERS_DEFAULT="${SLURM_CPUS_PER_TASK:-4}"
 
 # Dataset options
-TWO_VIEW_OFFSET=1                                           # set to integer for paired-window mode
+WINDOW_STRIDE=10                                            # stride between starts of consecutive windows
+MAX_WINDOWS_PER_CLIP=0                                     # 0 keeps all windows in long clips
+SINGLE_WINDOW_SHORT_CLIPS=1                                # 1 collapses short clips to one window
+SHORT_CLIP_WINDOW_THRESHOLD=2                              # short clip means <= this many candidates
 USE_OBJECT_FOCUS=1                                          # set to 1 to enable background blur
 
 # Linear eval on CIFAR (set LINEAR_EVAL_EVERY>0 to enable)
-LINEAR_EVAL_EVERY=0
+LINEAR_EVAL_EVERY=5
 LINEAR_EVAL_EPOCHS=5
 LINEAR_EVAL_BATCH_SIZE=256
 LINEAR_EVAL_LR=0.1
@@ -98,7 +101,7 @@ trap 'echo "Caught SIGTERM, requesting requeue."; should_requeue && requeue_job;
 # Each entry becomes one array task. Tweak as needed.
 # You can override any defaults above per-config (e.g., TEMPERATURE=0.2).
 CONFIGS=(
-  "WIN=5 STEP=10 BATCH=256 LR=1e-3 SEED=0"
+  "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0"
 )
 # ----------------------------------------------------------------------------
 
@@ -121,7 +124,7 @@ LR="${LR:-$LR_DEFAULT}"
 SEED="${SEED:-$SEED_DEFAULT}"
 NUM_WORKERS="${NUM_WORKERS:-$NUM_WORKERS_DEFAULT}"
 
-RUN_NAME="ws${WIN}_step${STEP}_lr${LR}_seed${SEED}"
+RUN_NAME="ws${WIN}_fs${STEP}_wstr${WINDOW_STRIDE}"
 CKPT_DIR="${CHECKPOINT_ROOT}/${RUN_NAME}"
 mkdir -p "$CKPT_DIR"
 
@@ -140,7 +143,13 @@ EXTRA_ARGS+=(--max-grad-norm "$MAX_GRAD_NORM")
 [[ -n "${MAX_BATCHES_PER_EPOCH}" ]] && EXTRA_ARGS+=(--max-batches-per-epoch "$MAX_BATCHES_PER_EPOCH")
 
 # Dataset options
-[[ -n "${TWO_VIEW_OFFSET}" ]] && EXTRA_ARGS+=(--two-view-offset "$TWO_VIEW_OFFSET")
+[[ -n "${WINDOW_STRIDE}" ]] && EXTRA_ARGS+=(--window-stride "$WINDOW_STRIDE")
+[[ -n "${MAX_WINDOWS_PER_CLIP}" ]] && EXTRA_ARGS+=(--max-windows-per-clip "$MAX_WINDOWS_PER_CLIP")
+if [[ "${SINGLE_WINDOW_SHORT_CLIPS}" == "1" ]]; then
+  EXTRA_ARGS+=(--single-window-short-clips --short-clip-window-threshold "$SHORT_CLIP_WINDOW_THRESHOLD")
+else
+  EXTRA_ARGS+=(--allow-multiple-short-windows)
+fi
 [[ "${USE_OBJECT_FOCUS}" == "1" ]] && EXTRA_ARGS+=(--use-object-focus)
 
 # Linear eval configuration

@@ -11,7 +11,7 @@ import csv
 import os
 import random
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence, Tuple, Union
+from typing import Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from evaluation.cifar_linear_eval import linear_eval_on_cifar
-from losses.paired_cosine_tt import PairedCosineTTLoss
+from losses.paired_cosine_tt import TemporalAllPairsTTLoss
 from models.simclr_resnet import SimCLRResNet18
 from utils.EgocentricWindowDataset_new import EgocentricWindowDataset
 
@@ -82,71 +82,80 @@ def _find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     return ckpts[-1]
 
 
-def _prepare_views(
-    batch: Union[torch.Tensor, Sequence[torch.Tensor]],
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def _prepare_temporal_windows(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
-    Normalizes the batch output from the dataset into (view0, view1).
+    Normalizes dataset output into temporal windows [B, T, C, H, Wimg].
     Supports:
-        - Tensor shape [B, W, C, H, Wimg] -> uses first/last frame as v0/v1.
-        - Tuple/list of two tensors from EgocentricWindowDataset two-view mode.
+        - Tensor shape [B, T, C, H, Wimg] (single-window mode only).
     """
-    if isinstance(batch, (list, tuple)):
-        v0, v1 = batch
-        if v0.dim() == 5:
-            v0 = v0[:, 0]
-            v1 = v1[:, -1]
-        return v0.to(device), v1.to(device)
-
-    batch = batch.to(device)
-    return batch[:, 0], batch[:, -1]
-
-
-def _coerce_metric_value(value):
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 1:
-            return value.item()
-        return value.detach().cpu().tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
-def _infer_epoch(metrics: Mapping[str, object]) -> Optional[int]:
-    for key in ("train/epoch", "linear_eval/epoch", "epoch"):
-        if key in metrics:
-            try:
-                return int(metrics[key])  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return None
-    return None
+    if batch.dim() != 5:
+        raise ValueError(f"Expected batch tensor to be [B, T, C, H, Wimg], got {tuple(batch.shape)}")
+    return batch.to(device)
 
 
 class CSVLogger:
-    def __init__(self, path: str, append: bool = True) -> None:
-        self.path = path
+    """Writes epoch-level train metrics and eval metrics to separate CSV files."""
+
+    def __init__(self, train_path: str, eval_path: str, append: bool = True) -> None:
+        self.train_path = train_path
+        self.eval_path = eval_path
+        self._train_file, self._train_writer = self._open_writer(
+            path=self.train_path,
+            append=append,
+            header=["epoch", "loss", "learning_rate", "decay_rate"],
+        )
+        self._eval_file, self._eval_writer = self._open_writer(
+            path=self.eval_path,
+            append=append,
+            header=["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "test_loss", "test_acc"],
+        )
+
+    @staticmethod
+    def _open_writer(path: str, append: bool, header: list[str]):
         log_dir = os.path.dirname(path)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
         file_exists = os.path.isfile(path)
         file_has_content = file_exists and os.path.getsize(path) > 0
         mode = "a" if append else "w"
-        self._file = open(path, mode, newline="")
-        self._writer = csv.writer(self._file)
+        file_obj = open(path, mode, newline="")
+        writer = csv.writer(file_obj)
         if not append or not file_has_content:
-            self._writer.writerow(["step", "epoch", "key", "value"])
-            self._file.flush()
+            writer.writerow(header)
+            file_obj.flush()
+        return file_obj, writer
 
-    def log(self, metrics: Mapping[str, object], step: Optional[int] = None, epoch: Optional[int] = None) -> None:
-        if epoch is None:
-            epoch = _infer_epoch(metrics)
-        for key, value in metrics.items():
-            self._writer.writerow([step, epoch, key, _coerce_metric_value(value)])
-        self._file.flush()
+    @staticmethod
+    def _to_scalar(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def log_train_epoch(self, epoch: int, loss: float, learning_rate: float, decay_rate: float) -> None:
+        self._train_writer.writerow([epoch, loss, learning_rate, decay_rate])
+        self._train_file.flush()
+
+    def log_eval_epoch(self, epoch: int, eval_metrics: Mapping[str, object]) -> None:
+        self._eval_writer.writerow(
+            [
+                epoch,
+                self._to_scalar(eval_metrics.get("train_loss")),
+                self._to_scalar(eval_metrics.get("train_acc")),
+                self._to_scalar(eval_metrics.get("val_loss")),
+                self._to_scalar(eval_metrics.get("val_acc")),
+                self._to_scalar(eval_metrics.get("test_loss")),
+                self._to_scalar(eval_metrics.get("test_acc")),
+            ]
+        )
+        self._eval_file.flush()
 
     def close(self) -> None:
-        self._file.close()
+        self._train_file.close()
+        self._eval_file.close()
 
 
 def _resolve_resume_checkpoint(args: argparse.Namespace) -> Optional[str]:
@@ -162,26 +171,40 @@ def _resolve_resume_checkpoint(args: argparse.Namespace) -> Optional[str]:
     return checkpoint_path
 
 
+def _default_eval_log_path(train_log_path: str) -> str:
+    root, ext = os.path.splitext(train_log_path)
+    if not ext:
+        ext = ".csv"
+    return f"{root}_eval{ext}"
+
+
 def _init_csv_logger(args: argparse.Namespace) -> Optional[CSVLogger]:
     if not getattr(args, "csv_log", False):
         return None
 
-    log_path = args.csv_log_path
-    if not log_path:
+    train_log_path = args.csv_log_path
+    if not train_log_path:
         if args.checkpoint_dir:
-            log_path = os.path.join(args.checkpoint_dir, "metrics.csv")
+            train_log_path = os.path.join(args.checkpoint_dir, "metrics.csv")
         else:
-            log_path = os.path.join("logs", "simclr_metrics.csv")
+            train_log_path = os.path.join("logs", "simclr_metrics.csv")
+    eval_log_path = args.eval_csv_log_path or _default_eval_log_path(train_log_path)
 
     resume_ckpt = _resolve_resume_checkpoint(args)
     append = resume_ckpt is not None
-    if not append and os.path.isfile(log_path) and os.path.getsize(log_path) > 0:
-        print(f"[INFO] Fresh run detected; overwriting existing CSV at {log_path}")
-    elif append and not os.path.isfile(log_path):
-        print(f"[WARN] Resume requested but CSV log not found; creating new file at {log_path}")
+    if not append and os.path.isfile(train_log_path) and os.path.getsize(train_log_path) > 0:
+        print(f"[INFO] Fresh run detected; overwriting existing train CSV at {train_log_path}")
+    elif append and not os.path.isfile(train_log_path):
+        print(f"[WARN] Resume requested but train CSV not found; creating new file at {train_log_path}")
 
-    print(f"[INFO] CSV logging to {log_path}")
-    return CSVLogger(log_path, append=append)
+    if not append and os.path.isfile(eval_log_path) and os.path.getsize(eval_log_path) > 0:
+        print(f"[INFO] Fresh run detected; overwriting existing eval CSV at {eval_log_path}")
+    elif append and not os.path.isfile(eval_log_path):
+        print(f"[WARN] Resume requested but eval CSV not found; creating new file at {eval_log_path}")
+
+    print(f"[INFO] Train CSV logging to {train_log_path}")
+    print(f"[INFO] Eval CSV logging to  {eval_log_path}")
+    return CSVLogger(train_path=train_log_path, eval_path=eval_log_path, append=append)
 
 
 # -----------------------
@@ -254,7 +277,7 @@ class SimCLRTrainer:
         )
 
         self.model = SimCLRResNet18(proj_dim=self.proj_dim).to(self.device)
-        self.criterion = PairedCosineTTLoss(temperature=self.temperature)
+        self.criterion = TemporalAllPairsTTLoss(temperature=self.temperature)
         self.optimizer = torch.optim.Adam(
             [
                 {"params": self.model.encoder.parameters(), "lr": self.lr},
@@ -304,17 +327,15 @@ class SimCLRTrainer:
         self.scheduler_state_dict = ckpt.get("scheduler_state_dict")
         self.global_step = ckpt.get("global_step", 0)
 
-    def _train_batch(self, v0: torch.Tensor, v1: torch.Tensor) -> Tuple[float, Optional[float]]:
-        bsz = v0.size(0)
+    def _train_batch(self, windows: torch.Tensor) -> Tuple[float, Optional[float]]:
+        bsz, t_steps, channels, height, width = windows.shape
         grad_norm = None
 
         if self.sub_batch_size is None or self.sub_batch_size >= bsz:
-            x = torch.cat([v0, v1], dim=0)
+            x = windows.reshape(bsz * t_steps, channels, height, width)
             _, z = self.model(x)
-            z1, z2 = torch.chunk(z, 2, dim=0)
-
-            z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
-            loss = self.criterion(z_pairs)
+            z_windows = z.reshape(bsz, t_steps, z.size(1))
+            loss = self.criterion(z_windows)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -328,16 +349,13 @@ class SimCLRTrainer:
         total_loss = 0.0
         for start in range(0, bsz, self.sub_batch_size):
             end = min(start + self.sub_batch_size, bsz)
-            sub_v0 = v0[start:end]
-            sub_v1 = v1[start:end]
-            sub_b = sub_v0.size(0)
+            sub_windows = windows[start:end]
+            sub_b = sub_windows.size(0)
 
-            x = torch.cat([sub_v0, sub_v1], dim=0)
+            x = sub_windows.reshape(sub_b * t_steps, channels, height, width)
             _, z = self.model(x)
-            z1, z2 = torch.chunk(z, 2, dim=0)
-
-            z_pairs = torch.stack([z1, z2], dim=1).reshape(-1, z1.size(1))
-            loss_sub = self.criterion(z_pairs)
+            z_windows = z.reshape(sub_b, t_steps, z.size(1))
+            loss_sub = self.criterion(z_windows)
 
             loss_scaled = loss_sub * (sub_b / bsz)
             loss_scaled.backward()
@@ -359,23 +377,13 @@ class SimCLRTrainer:
             if self.max_batches_per_epoch is not None and b_idx >= self.max_batches_per_epoch:
                 break
 
-            v0, v1 = _prepare_views(batch, self.device)
-            batch_loss_value, grad_norm = self._train_batch(v0, v1)
+            windows = _prepare_temporal_windows(batch, self.device)
+            batch_loss_value, _ = self._train_batch(windows)
 
             running_loss += batch_loss_value
             num_batches += 1
             self.global_step += 1
             pbar.set_postfix(loss=batch_loss_value)
-
-            if self.csv_logger is not None:
-                log_payload = {
-                    "train/loss_batch": batch_loss_value,
-                    "train/epoch": epoch,
-                    "train/global_step": self.global_step,
-                }
-                if grad_norm is not None:
-                    log_payload["train/grad_norm"] = grad_norm
-                self.csv_logger.log(log_payload, step=self.global_step, epoch=epoch)
 
         epoch_loss = running_loss / max(1, num_batches)
         return epoch_loss, num_batches
@@ -414,19 +422,7 @@ class SimCLRTrainer:
         )
 
         if self.csv_logger is not None:
-            self.csv_logger.log(
-                {
-                    "linear_eval/train_loss": eval_metrics["train_loss"],
-                    "linear_eval/train_acc": eval_metrics["train_acc"],
-                    "linear_eval/val_loss": eval_metrics["val_loss"],
-                    "linear_eval/val_acc": eval_metrics["val_acc"],
-                    "linear_eval/test_loss": eval_metrics["test_loss"],
-                    "linear_eval/test_acc": eval_metrics["test_acc"],
-                    "linear_eval/epoch": epoch,
-                },
-                step=epoch,
-                epoch=epoch,
-            )
+            self.csv_logger.log_eval_epoch(epoch=epoch, eval_metrics=eval_metrics)
 
     def _save_checkpoint(self, epoch: int) -> None:
         if self.checkpoint_dir is None:
@@ -476,21 +472,18 @@ class SimCLRTrainer:
             self.history["epoch_loss"].append(epoch_loss)
 
             lr_now = self.scheduler.get_last_lr()[0]
+            decay_rate = lr_now / self.lr if self.lr != 0 else 0.0
             print(
                 f"Epoch {epoch}/{self.epochs} - mean loss: {epoch_loss:.4f} "
                 f"- lr: {lr_now:.2e} - batches: {num_batches}"
             )
 
             if self.csv_logger is not None:
-                self.csv_logger.log(
-                    {
-                        "train/loss_epoch": epoch_loss,
-                        "train/lr": lr_now,
-                        "train/batches": num_batches,
-                        "train/epoch": epoch,
-                    },
-                    step=epoch,
+                self.csv_logger.log_train_epoch(
                     epoch=epoch,
+                    loss=epoch_loss,
+                    learning_rate=lr_now,
+                    decay_rate=decay_rate,
                 )
 
             self._run_linear_eval(epoch)
@@ -576,7 +569,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root-dir", type=str, default="Images_ego", help="Root folder with frame subfolders.")
     parser.add_argument("--window-size", type=int, default=5, help="Frames per window.")
     parser.add_argument("--frame-step", type=int, default=10, help="Stride in frames inside a window.")
-    parser.add_argument("--two-view-offset", type=int, default=0, help="If >0, dataset returns (view0, view1) windows.")
+    parser.add_argument("--window-stride", type=int, default=1, help="Stride in frames between consecutive window starts.")
+    parser.add_argument(
+        "--max-windows-per-clip",
+        type=int,
+        default=0,
+        help="Cap windows sampled from each clip (0 keeps all valid windows).",
+    )
+    parser.add_argument(
+        "--single-window-short-clips",
+        dest="single_window_short_clips",
+        action="store_true",
+        default=True,
+        help="Collapse short clips to a single representative window.",
+    )
+    parser.add_argument(
+        "--allow-multiple-short-windows",
+        dest="single_window_short_clips",
+        action="store_false",
+        help="Keep all candidate windows even for short clips.",
+    )
+    parser.add_argument(
+        "--short-clip-window-threshold",
+        type=int,
+        default=2,
+        help="If a clip has <= this many candidate windows, use one window when short-clip collapse is enabled.",
+    )
     parser.add_argument("--use-object-focus", action="store_true", help="Blur background, keep object regions sharp.")
     parser.add_argument("--image-size", type=int, default=224, help="Final image side length after cropping.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers.")
@@ -630,7 +648,13 @@ def parse_args() -> argparse.Namespace:
         "--csv-log-path",
         type=str,
         default=None,
-        help="Path to CSV log file (defaults to checkpoint dir if set).",
+        help="Path to train CSV log file (defaults to checkpoint dir if set).",
+    )
+    parser.add_argument(
+        "--eval-csv-log-path",
+        type=str,
+        default=None,
+        help="Path to eval CSV log file (defaults to <csv-log-path>_eval.csv).",
     )
 
     return parser.parse_args()
@@ -648,11 +672,14 @@ def main() -> None:
         root_dir=args.root_dir,
         window_size=args.window_size,
         frame_step=args.frame_step,
+        window_stride=args.window_stride,
         transform=transform,
         return_stack=True,
         verbose=True,
         use_object_focus=args.use_object_focus,
-        two_view_offset=args.two_view_offset,
+        max_windows_per_clip=args.max_windows_per_clip,
+        single_window_short_clips=args.single_window_short_clips,
+        short_clip_window_threshold=args.short_clip_window_threshold,
     )
 
     if len(dataset) == 0:
