@@ -56,7 +56,7 @@ LINEAR_EVAL_TRAIN_FRACTION=0.7
 LINEAR_EVAL_SPLIT_SEED=42
 CIFAR_DATASET="cifar10"
 CIFAR_DATA_DIR="$PWD/data/cifar"
-CIFAR_DOWNLOAD=0
+CIFAR_DOWNLOAD=1
 
 # CSV logging
 ENABLE_CSV_LOG=1                                            # set to 1 to enable CSV logging
