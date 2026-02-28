@@ -23,7 +23,7 @@ ROOT_DIR="/N/project/cogai/dhkara/cropped_clips"          # folder with extracte
 CHECKPOINT_ROOT="$PWD/checkpoints"                        # base output dir for checkpoints
 
 # Core training settings
-EPOCHS=25
+EPOCHS=100
 IMAGE_SIZE=224
 BATCH_SIZE_DEFAULT=256
 LR_DEFAULT=1e-3
@@ -101,7 +101,9 @@ trap 'echo "Caught SIGTERM, requesting requeue."; should_requeue && requeue_job;
 # Each entry becomes one array task. Tweak as needed.
 # You can override any defaults above per-config (e.g., TEMPERATURE=0.2).
 CONFIGS=(
-  "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0"
+  "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0",
+  "WIN=5 STEP=2 BATCH=256 LR=1e-3 SEED=0",
+  "WIN=5 STEP=2 BATCH=256 LR=1e-4 SEED=0",
 )
 # ----------------------------------------------------------------------------
 
