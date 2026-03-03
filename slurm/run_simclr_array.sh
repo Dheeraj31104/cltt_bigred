@@ -15,6 +15,7 @@
 #SBATCH --mail-type=BEGIN,END,REQUEUE
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@120
+#SBATCH --array=0-2
 
 set -euo pipefail
 
@@ -101,9 +102,9 @@ trap 'echo "Caught SIGTERM, requesting requeue."; should_requeue && requeue_job;
 # Each entry becomes one array task. Tweak as needed.
 # You can override any defaults above per-config (e.g., TEMPERATURE=0.2).
 CONFIGS=(
-  "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0",
-  "WIN=5 STEP=2 BATCH=256 LR=1e-3 SEED=0",
-  "WIN=5 STEP=2 BATCH=256 LR=1e-4 SEED=0",
+  "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0"
+  "WIN=5 STEP=2 BATCH=256 LR=1e-3 SEED=0"
+  "WIN=5 STEP=2 BATCH=256 LR=1e-4 SEED=0"
 )
 # ----------------------------------------------------------------------------
 

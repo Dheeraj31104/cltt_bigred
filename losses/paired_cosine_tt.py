@@ -28,13 +28,12 @@ class PairedCosineTTLoss(nn.Module):
 
         pos_logits = sim[idx, pos_idx]
 
-        neg_mask = torch.ones((n, n), dtype=torch.bool, device=z.device)
-        neg_mask.fill_diagonal_(False)
-        neg_mask[idx, pos_idx] = False
+        # Denominator: all non-self pairs (positives + negatives), per standard InfoNCE.
+        denom_mask = ~torch.eye(n, dtype=torch.bool, device=z.device)
+        denom_logits = sim.masked_fill(~denom_mask, float("-inf"))
+        log_denom = torch.logsumexp(denom_logits, dim=1)
 
-        neg_logits = sim[neg_mask].view(n, n - 2)
-
-        loss_per = -(pos_logits - torch.logsumexp(neg_logits, dim=1))
+        loss_per = -(pos_logits - log_denom)
         return loss_per.mean()
 
 

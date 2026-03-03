@@ -57,6 +57,7 @@ def build_transforms(image_size: int = 224) -> T.Compose:
             T.Resize(image_size),
             T.CenterCrop(image_size),
             T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
 
@@ -331,41 +332,34 @@ class SimCLRTrainer:
         bsz, t_steps, channels, height, width = windows.shape
         grad_norm = None
 
+        self.optimizer.zero_grad()
+
         if self.sub_batch_size is None or self.sub_batch_size >= bsz:
             x = windows.reshape(bsz * t_steps, channels, height, width)
             _, z = self.model(x)
-            z_windows = z.reshape(bsz, t_steps, z.size(1))
-            loss = self.criterion(z_windows)
+        else:
+            # Collect embeddings across sub-batches into a single tensor so that
+            # InfoNCE sees the full negative pool. Each sub-batch's graph is retained
+            # in memory until the single backward call below.
+            z_parts = []
+            for start in range(0, bsz, self.sub_batch_size):
+                end = min(start + self.sub_batch_size, bsz)
+                sub_windows = windows[start:end]
+                sub_b = sub_windows.size(0)
+                x_sub = sub_windows.reshape(sub_b * t_steps, channels, height, width)
+                _, z_sub = self.model(x_sub)
+                z_parts.append(z_sub)
+            z = torch.cat(z_parts, dim=0)  # [B*T, D]
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            if self.max_grad_norm is not None:
-                grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm).item()
-            self.optimizer.step()
+        z_windows = z.reshape(bsz, t_steps, z.size(1))
+        loss = self.criterion(z_windows)
 
-            return loss.item(), grad_norm
-
-        self.optimizer.zero_grad()
-        total_loss = 0.0
-        for start in range(0, bsz, self.sub_batch_size):
-            end = min(start + self.sub_batch_size, bsz)
-            sub_windows = windows[start:end]
-            sub_b = sub_windows.size(0)
-
-            x = sub_windows.reshape(sub_b * t_steps, channels, height, width)
-            _, z = self.model(x)
-            z_windows = z.reshape(sub_b, t_steps, z.size(1))
-            loss_sub = self.criterion(z_windows)
-
-            loss_scaled = loss_sub * (sub_b / bsz)
-            loss_scaled.backward()
-            total_loss += loss_sub.item() * (sub_b / bsz)
-
+        loss.backward()
         if self.max_grad_norm is not None:
             grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm).item()
         self.optimizer.step()
 
-        return total_loss, grad_norm
+        return loss.item(), grad_norm
 
     def _train_epoch(self, epoch: int) -> Tuple[float, int]:
         self.model.train()

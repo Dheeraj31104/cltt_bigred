@@ -1,0 +1,148 @@
+================================================================================
+CLTT BigRed SimCLR - Bug Fixes & Changes
+Date: 2026-03-03
+================================================================================
+
+--------------------------------------------------------------------------------
+BUG 1 - CRITICAL | slurm/run_simclr_array.sh
+Missing #SBATCH --array directive
+--------------------------------------------------------------------------------
+Problem:
+  The Slurm job array script had no #SBATCH --array=... directive. Without it,
+  sbatch submits a single job (not an array). SLURM_ARRAY_TASK_ID is unset,
+  which the script silently defaults to 0, so only the first CONFIGS entry ever
+  runs regardless of how many configs are defined.
+
+Fix:
+  Added the following line to the #SBATCH header:
+    #SBATCH --array=0-2
+  (Upper bound = len(CONFIGS) - 1. Update this whenever CONFIGS changes.)
+
+--------------------------------------------------------------------------------
+BUG 2 - CRITICAL | slurm/run_simclr_array.sh
+Trailing commas in CONFIGS bash array corrupt variable values
+--------------------------------------------------------------------------------
+Problem:
+  CONFIGS entries had Python-style trailing commas:
+    CONFIGS=(
+      "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0",   <- comma
+      ...
+    )
+  In bash, array elements are whitespace-separated. The comma is concatenated
+  to the preceding quoted string, so CONFIGS[0] becomes:
+    "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0,"
+  When eval runs this, SEED is set to "0," (not "0"). Passing --seed 0, to
+  argparse raises a ValueError since "0," is not a valid integer. Same issue
+  affects LR and other last-token variables.
+
+Fix:
+  Removed all trailing commas from CONFIGS:
+    CONFIGS=(
+      "WIN=5 STEP=2 BATCH=256 LR=1e-2 SEED=0"
+      "WIN=5 STEP=2 BATCH=256 LR=1e-3 SEED=0"
+      "WIN=5 STEP=2 BATCH=256 LR=1e-4 SEED=0"
+    )
+
+--------------------------------------------------------------------------------
+BUG 3 - SIGNIFICANT | losses/paired_cosine_tt.py
+PairedCosineTTLoss excludes the positive pair from InfoNCE denominator
+--------------------------------------------------------------------------------
+Problem:
+  The forward() method computed:
+    loss = -(pos_logit - logsumexp(neg_logits_only))
+  The positive pair was excluded from the denominator. Standard InfoNCE requires
+  the denominator to be the sum over ALL non-self pairs (positives + negatives):
+    loss = -(pos_logit - logsumexp(all non-self logits))
+  Excluding the positive makes the loss softer than intended and inconsistent
+  with TemporalAllPairsTTLoss (which correctly includes all non-self pairs).
+
+  Note: PairedCosineTTLoss is not used in the main training pipeline
+  (TemporalAllPairsTTLoss is used), but the bug is still incorrect.
+
+Fix:
+  Replaced the neg_mask / neg_logits approach with a single denom_mask that
+  excludes only the diagonal (self-similarity):
+
+  Before:
+    neg_mask = torch.ones((n, n), dtype=torch.bool, device=z.device)
+    neg_mask.fill_diagonal_(False)
+    neg_mask[idx, pos_idx] = False
+    neg_logits = sim[neg_mask].view(n, n - 2)
+    loss_per = -(pos_logits - torch.logsumexp(neg_logits, dim=1))
+
+  After:
+    denom_mask = ~torch.eye(n, dtype=torch.bool, device=z.device)
+    denom_logits = sim.masked_fill(~denom_mask, float("-inf"))
+    log_denom = torch.logsumexp(denom_logits, dim=1)
+    loss_per = -(pos_logits - log_denom)
+
+--------------------------------------------------------------------------------
+BUG 4 - SIGNIFICANT | train_simclr.py
+Sub-batch gradient accumulation is mathematically invalid for InfoNCE
+--------------------------------------------------------------------------------
+Problem:
+  The sub-batch accumulation loop in _train_batch() split the batch into chunks
+  and computed InfoNCE independently on each chunk:
+    for sub-batch:
+        loss_sub = criterion(z_sub_windows)   # InfoNCE on sub_b windows only
+        loss_scaled = loss_sub * (sub_b / bsz)
+        loss_scaled.backward()
+  InfoNCE is not decomposable: the denominator of each anchor's softmax depends
+  on ALL other windows in the batch (the negative pool). Computing InfoNCE on a
+  sub-batch means each anchor only sees sub_b-1 negatives instead of bsz-1.
+  The accumulated gradient is a biased estimate of the full-batch gradient,
+  effectively training with a weaker contrastive signal.
+
+Fix:
+  Refactored _train_batch() to collect all embeddings across sub-batches first
+  (retaining the full computation graph), then compute a single full-batch
+  InfoNCE loss so every anchor sees the full negative pool:
+
+    z_parts = []
+    for sub-batch:
+        _, z_sub = self.model(x_sub)
+        z_parts.append(z_sub)
+    z = torch.cat(z_parts, dim=0)       # [B*T, D] — full batch
+    z_windows = z.reshape(bsz, t_steps, z.size(1))
+    loss = self.criterion(z_windows)    # single correct full-batch InfoNCE
+    loss.backward()
+
+  The sub-batch and non-sub-batch paths now produce mathematically identical
+  losses and gradients. The trade-off is that all sub-batch graphs remain in
+  memory until the single backward call.
+
+--------------------------------------------------------------------------------
+BUG 5 - SIGNIFICANT | train_simclr.py
+No image normalization in build_transforms() — train/eval distribution mismatch
+--------------------------------------------------------------------------------
+Problem:
+  build_transforms() applied only Resize, CenterCrop, and ToTensor:
+    T.ToTensor()  -> pixel values in [0, 1], not normalized
+  ResNet's BatchNorm layers accumulate running statistics during training based
+  on this unnormalized input distribution. The CIFAR linear evaluation uses
+  cifar-specific normalization (mean/std from build_cifar_transforms), so the
+  encoder's BatchNorm running stats reflect a different input distribution than
+  what linear eval feeds in. This causes a distribution mismatch that degrades
+  linear eval accuracy.
+
+Fix:
+  Added standard ImageNet normalization to build_transforms():
+
+  Before:
+    T.ToTensor()
+
+  After:
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+  ImageNet stats are the conventional choice for ResNet backbones regardless of
+  whether pretrained weights are used, as the architecture and BatchNorm
+  behavior are designed around this normalization scale.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+  slurm/run_simclr_array.sh      Bugs 1, 2
+  losses/paired_cosine_tt.py     Bug 3
+  train_simclr.py                Bugs 4, 5
+================================================================================
