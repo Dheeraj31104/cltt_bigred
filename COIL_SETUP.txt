@@ -1,0 +1,48 @@
+================================================================================
+COIL Dataset Setup Guide
+================================================================================
+
+The eval_coil_sweep.py script does NOT download COIL automatically.
+You need to download it manually on your server.
+
+--------------------------------------------------------------------------------
+COIL-20 (20 objects, grayscale, 1440 images)
+--------------------------------------------------------------------------------
+wget http://www.cs.columbia.edu/CAVE/databases/SLAM_coil-20_coil-100/coil-20/coil-20-proc.zip
+unzip coil-20-proc.zip -d ./data/coil-20
+
+--------------------------------------------------------------------------------
+COIL-100 (100 objects, colour, 7200 images)
+--------------------------------------------------------------------------------
+wget http://www.cs.columbia.edu/CAVE/databases/SLAM_coil-20_coil-100/coil-100/coil-100.zip
+unzip coil-100.zip -d ./data/coil-100
+
+--------------------------------------------------------------------------------
+Expected directory layout after unzipping
+--------------------------------------------------------------------------------
+data/coil-20/
+    obj1__0.png
+    obj1__5.png
+    ...
+    obj20__355.png
+
+This flat naming convention is handled automatically by COILDataset.
+No extra preprocessing needed.
+
+--------------------------------------------------------------------------------
+Running the sweep
+--------------------------------------------------------------------------------
+python eval_coil_sweep.py \
+    --checkpoint-dir ./checkpoints/ws5_fs2_wstr10 \
+    --coil-dir ./data/coil-20 \
+    --output-csv ./results/coil_sweep.csv
+
+--------------------------------------------------------------------------------
+Note
+--------------------------------------------------------------------------------
+If the Columbia URLs are down (they sometimes are), COIL-20 is also
+mirrored on Kaggle:
+
+    kaggle datasets download jessicali9530/coil20
+
+================================================================================
