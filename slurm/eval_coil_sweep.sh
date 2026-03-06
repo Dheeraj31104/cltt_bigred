@@ -7,16 +7,31 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --output=logs/coil_eval_%j.out
+#SBATCH --output=logs/coil_eval_%A_%a.out
 #SBATCH --mail-user=dhkara@iu.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --array=0-2
 
 set -euo pipefail
 
-# ---- Settings (edit these) --------------------------------------------------
-CHECKPOINT_DIR="$PWD/checkpoints/ws5_fs2_wstr10"
+# ---- Checkpoint dirs to evaluate (must match run_simclr_array.sh configs) ---
+CHECKPOINT_DIRS=(
+  "ws5_fs2_wstr10_lr1e-2_seed0"
+  "ws5_fs2_wstr10_lr1e-3_seed0"
+  "ws5_fs2_wstr10_lr1e-4_seed0"
+)
+# -----------------------------------------------------------------------------
+
+IDX="${SLURM_ARRAY_TASK_ID:-0}"
+if [[ "$IDX" -ge "${#CHECKPOINT_DIRS[@]}" ]]; then
+  echo "Array index $IDX exceeds CHECKPOINT_DIRS size ${#CHECKPOINT_DIRS[@]}" >&2
+  exit 1
+fi
+
+RUN_NAME="${CHECKPOINT_DIRS[$IDX]}"
+CHECKPOINT_DIR="$PWD/checkpoints/${RUN_NAME}"
 COIL_DIR="$PWD/data/coil-20/coil-20-proc"
-OUTPUT_CSV="$PWD/results/coil_sweep.csv"
+OUTPUT_CSV="$PWD/results/coil_${RUN_NAME}.csv"
 
 IMAGE_SIZE=224
 BATCH_SIZE=64
@@ -28,7 +43,6 @@ VAL_FRACTION=0.15
 SPLIT_SEED=42
 NUM_WORKERS=2
 PROJ_DIM=128
-# -----------------------------------------------------------------------------
 
 mkdir -p logs results
 
@@ -39,7 +53,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate torch-env
 set -u
 
-echo "[eval_coil_sweep] Job ${SLURM_JOB_ID} started on $(hostname)"
+echo "[eval_coil_sweep] Job ${SLURM_JOB_ID} array task ${IDX} started on $(hostname)"
 echo "[eval_coil_sweep] Checkpoint dir : ${CHECKPOINT_DIR}"
 echo "[eval_coil_sweep] COIL dir        : ${COIL_DIR}"
 echo "[eval_coil_sweep] Output CSV      : ${OUTPUT_CSV}"
@@ -57,6 +71,7 @@ srun python eval_coil_sweep.py \
     --val-fraction    "$VAL_FRACTION" \
     --split-seed      "$SPLIT_SEED" \
     --num-workers     "$NUM_WORKERS" \
-    --proj-dim        "$PROJ_DIM"
+    --proj-dim        "$PROJ_DIM" \
+    --random-init-baseline
 
 echo "[eval_coil_sweep] Done."
