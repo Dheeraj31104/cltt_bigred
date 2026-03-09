@@ -19,20 +19,23 @@
 
 set -euo pipefail
 
-# ---- User settings (edit these) ---------------------------------------------
-ROOT_DIR="/N/project/cogai/dhkara/cropped_clips"
-CHECKPOINT_ROOT="$PWD/checkpoints"
+# ---- User settings (override any of these from the command line) ------------
+# Usage examples:
+#   BACKBONE=swin_s sbatch slurm/run_swin_array.sh
+#   BACKBONE=swin_b EPOCHS=50 TEMPERATURE=0.2 sbatch slurm/run_swin_array.sh
+ROOT_DIR="${ROOT_DIR:-/N/project/cogai/dhkara/cropped_clips}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$PWD/checkpoints}"
 
-BACKBONE="swin_t"   # swin_t | swin_s | swin_b
+BACKBONE="${BACKBONE:-swin_t}"          # swin_t | swin_s | swin_b
 
 # Core training settings
-EPOCHS=100
-IMAGE_SIZE=224
-BATCH_SIZE_DEFAULT=64        # Swin needs more memory; keep batch smaller
-LR_DEFAULT=1e-3
-SEED_DEFAULT=0
-TEMPERATURE=0.5
-PROJ_DIM=128
+EPOCHS="${EPOCHS:-100}"
+IMAGE_SIZE="${IMAGE_SIZE:-224}"
+BATCH_SIZE_DEFAULT="${BATCH_SIZE_DEFAULT:-64}"   # Swin needs more memory; keep batch smaller
+LR_DEFAULT="${LR_DEFAULT:-1e-3}"
+SEED_DEFAULT="${SEED_DEFAULT:-0}"
+TEMPERATURE="${TEMPERATURE:-0.5}"
+PROJ_DIM="${PROJ_DIM:-128}"
 WEIGHT_DECAY=1e-4
 MAX_GRAD_NORM=1.0
 
