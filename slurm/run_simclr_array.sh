@@ -19,20 +19,26 @@
 
 set -euo pipefail
 
-# ---- User settings (edit these) ---------------------------------------------
-ROOT_DIR="/N/project/cogai/dhkara/cropped_clips"          # folder with extracted frame folders
-CHECKPOINT_ROOT="$PWD/checkpoints"                        # base output dir for checkpoints
+# ---- User settings (override any of these from the command line) ------------
+# Usage examples:
+#   sbatch slurm/run_simclr_array.sh                          (resnet18, defaults)
+#   BACKBONE=swin_t sbatch slurm/run_simclr_array.sh
+#   BACKBONE=swin_s EPOCHS=50 TEMPERATURE=0.2 sbatch slurm/run_simclr_array.sh
+ROOT_DIR="${ROOT_DIR:-/N/project/cogai/dhkara/cropped_clips}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$PWD/checkpoints}"
+
+BACKBONE="${BACKBONE:-resnet18}"        # resnet18 | swin_t | swin_s | swin_b
 
 # Core training settings
-EPOCHS=100
-IMAGE_SIZE=224
-BATCH_SIZE_DEFAULT=256
-LR_DEFAULT=1e-3
-SEED_DEFAULT=0
-TEMPERATURE=0.5
-PROJ_DIM=128
-WEIGHT_DECAY=1e-4
-MAX_GRAD_NORM=1.0
+EPOCHS="${EPOCHS:-100}"
+IMAGE_SIZE="${IMAGE_SIZE:-224}"
+BATCH_SIZE_DEFAULT="${BATCH_SIZE_DEFAULT:-256}"
+LR_DEFAULT="${LR_DEFAULT:-1e-3}"
+SEED_DEFAULT="${SEED_DEFAULT:-0}"
+TEMPERATURE="${TEMPERATURE:-0.5}"
+PROJ_DIM="${PROJ_DIM:-128}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 # Runtime tuning
 SUB_BATCH_SIZE=""                                         # set to "" to disable grad accumulation
@@ -127,14 +133,14 @@ LR="${LR:-$LR_DEFAULT}"
 SEED="${SEED:-$SEED_DEFAULT}"
 NUM_WORKERS="${NUM_WORKERS:-$NUM_WORKERS_DEFAULT}"
 
-RUN_NAME="ws${WIN}_fs${STEP}_wstr${WINDOW_STRIDE}_lr${LR}_seed${SEED}"
+RUN_NAME="${BACKBONE}_ws${WIN}_fs${STEP}_wstr${WINDOW_STRIDE}_lr${LR}_seed${SEED}"
 CKPT_DIR="${CHECKPOINT_ROOT}/${RUN_NAME}"
 mkdir -p "$CKPT_DIR"
 
 # Build optional args cleanly
 EXTRA_ARGS=()
 
-# Core args that now exist explicitly in train_simclr.py
+EXTRA_ARGS+=(--backbone "$BACKBONE")
 EXTRA_ARGS+=(--image-size "$IMAGE_SIZE")
 EXTRA_ARGS+=(--temperature "$TEMPERATURE")
 EXTRA_ARGS+=(--proj-dim "$PROJ_DIM")
