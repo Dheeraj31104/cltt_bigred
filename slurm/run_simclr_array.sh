@@ -21,13 +21,10 @@ set -euo pipefail
 
 # ---- User settings (override any of these from the command line) ------------
 # Usage examples:
-#   sbatch slurm/run_simclr_array.sh                          (resnet18, defaults)
-#   BACKBONE=swin_t sbatch slurm/run_simclr_array.sh
-#   BACKBONE=swin_s EPOCHS=50 TEMPERATURE=0.2 sbatch slurm/run_simclr_array.sh
+#   sbatch slurm/run_simclr_array.sh
+#   EPOCHS=50 TEMPERATURE=0.2 sbatch slurm/run_simclr_array.sh
 ROOT_DIR="${ROOT_DIR:-/N/project/cogai/dhkara/cropped_clips}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$PWD/checkpoints}"
-
-BACKBONE="${BACKBONE:-resnet18}"        # resnet18 | swin_t | swin_s | swin_b
 
 # Core training settings
 EPOCHS="${EPOCHS:-100}"
@@ -133,14 +130,13 @@ LR="${LR:-$LR_DEFAULT}"
 SEED="${SEED:-$SEED_DEFAULT}"
 NUM_WORKERS="${NUM_WORKERS:-$NUM_WORKERS_DEFAULT}"
 
-RUN_NAME="${BACKBONE}_ws${WIN}_fs${STEP}_wstr${WINDOW_STRIDE}_lr${LR}_seed${SEED}"
+RUN_NAME="ws${WIN}_fs${STEP}_wstr${WINDOW_STRIDE}_lr${LR}_seed${SEED}"
 CKPT_DIR="${CHECKPOINT_ROOT}/${RUN_NAME}"
 mkdir -p "$CKPT_DIR"
 
 # Build optional args cleanly
 EXTRA_ARGS=()
 
-EXTRA_ARGS+=(--backbone "$BACKBONE")
 EXTRA_ARGS+=(--image-size "$IMAGE_SIZE")
 EXTRA_ARGS+=(--temperature "$TEMPERATURE")
 EXTRA_ARGS+=(--proj-dim "$PROJ_DIM")

@@ -24,7 +24,6 @@ from tqdm.auto import tqdm
 from evaluation.cifar_linear_eval import linear_eval_on_cifar
 from losses.paired_cosine_tt import TemporalAllPairsTTLoss
 from models.simclr_resnet import SimCLRResNet18
-from models.simclr_swin import SimCLRSwin
 from utils.EgocentricWindowDataset_new import EgocentricWindowDataset
 
 
@@ -250,7 +249,6 @@ class SimCLRTrainer:
         num_workers: int = 4,
         linear_eval: Optional[LinearEvalConfig] = None,
         csv_logger: Optional[CSVLogger] = None,
-        backbone: str = "resnet18",
     ) -> None:
         self.dataset = dataset
         self.device = device
@@ -270,7 +268,6 @@ class SimCLRTrainer:
         self.num_workers = num_workers
         self.linear_eval = linear_eval
         self.csv_logger = csv_logger
-        self.backbone = backbone
 
         self.loader = DataLoader(
             self.dataset,
@@ -280,12 +277,7 @@ class SimCLRTrainer:
             pin_memory=self.device.type == "cuda",
         )
 
-        if self.backbone == "resnet18":
-            self.model = SimCLRResNet18(proj_dim=self.proj_dim).to(self.device)
-        elif self.backbone in ("swin_t", "swin_s", "swin_b"):
-            self.model = SimCLRSwin(variant=self.backbone, proj_dim=self.proj_dim).to(self.device)
-        else:
-            raise ValueError(f"Unknown backbone '{self.backbone}'. Choose from resnet18, swin_t, swin_s, swin_b.")
+        self.model = SimCLRResNet18(proj_dim=self.proj_dim).to(self.device)
         self.criterion = TemporalAllPairsTTLoss(temperature=self.temperature)
         self.optimizer = torch.optim.AdamW(
             [
@@ -437,7 +429,7 @@ class SimCLRTrainer:
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "proj_dim": self.proj_dim,
-                "backbone": self.backbone,
+                "backbone": "resnet18",
                 "history": self.history,
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "global_step": self.global_step,
@@ -457,7 +449,7 @@ class SimCLRTrainer:
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "proj_dim": self.proj_dim,
-                "backbone": self.backbone,
+                "backbone": "resnet18",
                 "history": self.history,
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "global_step": self.global_step,
@@ -524,7 +516,6 @@ def train_simclr_from_buffer(
     cifar_data_dir: str = "data/cifar",
     cifar_download: bool = False,
     csv_logger: Optional[CSVLogger] = None,
-    backbone: str = "resnet18",
 ) -> Tuple[nn.Module, dict]:
     linear_eval_cfg = LinearEvalConfig(
         every=linear_eval_every,
@@ -559,7 +550,6 @@ def train_simclr_from_buffer(
         num_workers=num_workers,
         linear_eval=linear_eval_cfg,
         csv_logger=csv_logger,
-        backbone=backbone,
     )
     return trainer.fit()
 
@@ -602,15 +592,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-object-focus", action="store_true", help="Blur background, keep object regions sharp.")
     parser.add_argument("--image-size", type=int, default=224, help="Final image side length after cropping.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers.")
-
-    # Model
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="resnet18",
-        choices=["resnet18", "swin_t", "swin_s", "swin_b"],
-        help="Encoder backbone (default: resnet18).",
-    )
 
     # Training
     parser.add_argument("--epochs", type=int, default=25)
@@ -728,7 +709,6 @@ def main() -> None:
             cifar_data_dir=args.cifar_data_dir,
             cifar_download=args.cifar_download,
             csv_logger=csv_logger,
-            backbone=args.backbone,
         )
     finally:
         if csv_logger is not None:
