@@ -46,6 +46,12 @@ def _restore_encoder(encoder: nn.Module, states: List[bool]) -> None:
         param.requires_grad_(state)
 
 
+def _topk_correct(logits: torch.Tensor, targets: torch.Tensor, k: int) -> int:
+    k = min(k, logits.size(1))
+    _, pred = logits.topk(k, dim=1)
+    return pred.eq(targets.view(-1, 1).expand_as(pred)).any(dim=1).sum().item()
+
+
 def _eval_loader(
     encoder: nn.Module,
     linear_head: nn.Module,
@@ -53,9 +59,10 @@ def _eval_loader(
     device: torch.device,
     criterion: nn.Module,
     max_batches: Optional[int],
-) -> Tuple[float, float, int]:
+) -> Tuple[float, float, float, int]:
     eval_loss = 0.0
     eval_correct = 0
+    eval_top5_correct = 0
     eval_total = 0
     eval_batches = 0
 
@@ -72,11 +79,13 @@ def _eval_loader(
             eval_loss += loss.item()
             eval_batches += 1
             eval_correct += (logits.argmax(dim=1) == y).sum().item()
+            eval_top5_correct += _topk_correct(logits, y, k=5)
             eval_total += y.size(0)
 
     eval_loss = eval_loss / max(1, eval_batches)
     eval_acc = eval_correct / max(1, eval_total)
-    return eval_loss, eval_acc, eval_batches
+    eval_top5_acc = eval_top5_correct / max(1, eval_total)
+    return eval_loss, eval_acc, eval_top5_acc, eval_batches
 
 
 def linear_eval_on_cifar(
@@ -158,10 +167,12 @@ def linear_eval_on_cifar(
 
     train_loss = 0.0
     train_acc = 0.0
+    train_top5_acc = 0.0
     for _ in range(max(1, eval_epochs)):
         linear_head.train()
         running_loss = 0.0
         correct = 0
+        top5_correct = 0
         total = 0
         num_batches = 0
         for b_idx, (x, y) in enumerate(train_loader):
@@ -182,13 +193,15 @@ def linear_eval_on_cifar(
             running_loss += loss.item()
             num_batches += 1
             correct += (logits.argmax(dim=1) == y).sum().item()
+            top5_correct += _topk_correct(logits, y, k=5)
             total += y.size(0)
 
         train_loss = running_loss / max(1, num_batches)
         train_acc = correct / max(1, total)
+        train_top5_acc = top5_correct / max(1, total)
 
     linear_head.eval()
-    val_loss, val_acc, val_batches = _eval_loader(
+    val_loss, val_acc, val_top5_acc, val_batches = _eval_loader(
         encoder=encoder,
         linear_head=linear_head,
         loader=val_loader,
@@ -196,7 +209,7 @@ def linear_eval_on_cifar(
         criterion=criterion,
         max_batches=max_batches,
     )
-    test_loss, test_acc, test_batches = _eval_loader(
+    test_loss, test_acc, test_top5_acc, test_batches = _eval_loader(
         encoder=encoder,
         linear_head=linear_head,
         loader=test_loader,
@@ -212,10 +225,13 @@ def linear_eval_on_cifar(
     return {
         "train_loss": train_loss,
         "train_acc": train_acc,
+        "train_top5_acc": train_top5_acc,
         "val_loss": val_loss,
         "val_acc": val_acc,
+        "val_top5_acc": val_top5_acc,
         "test_loss": test_loss,
         "test_acc": test_acc,
+        "test_top5_acc": test_top5_acc,
         "num_classes": num_classes,
         "train_fraction": train_fraction,
         "train_size": train_len,

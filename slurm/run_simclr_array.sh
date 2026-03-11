@@ -49,17 +49,19 @@ SINGLE_WINDOW_SHORT_CLIPS=1                                # 1 collapses short c
 SHORT_CLIP_WINDOW_THRESHOLD=2                              # short clip means <= this many candidates
 USE_OBJECT_FOCUS=1                                          # set to 1 to enable background blur
 
-# Linear eval on CIFAR (set LINEAR_EVAL_EVERY>0 to enable)
-LINEAR_EVAL_EVERY=5
-LINEAR_EVAL_EPOCHS=5
-LINEAR_EVAL_BATCH_SIZE=256
-LINEAR_EVAL_LR=0.1
-LINEAR_EVAL_WEIGHT_DECAY=0.0
+# Linear eval (set LINEAR_EVAL_EVERY>0 to enable)
+# Set CIFAR_DATASET="imagenet" and IMAGENET_DATA_DIR to use ImageNet subset instead of CIFAR
+LINEAR_EVAL_EVERY="${LINEAR_EVAL_EVERY:-5}"
+LINEAR_EVAL_EPOCHS="${LINEAR_EVAL_EPOCHS:-5}"
+LINEAR_EVAL_BATCH_SIZE="${LINEAR_EVAL_BATCH_SIZE:-256}"
+LINEAR_EVAL_LR="${LINEAR_EVAL_LR:-0.1}"
+LINEAR_EVAL_WEIGHT_DECAY="${LINEAR_EVAL_WEIGHT_DECAY:-0.0}"
 LINEAR_EVAL_MAX_BATCHES=""
-LINEAR_EVAL_TRAIN_FRACTION=0.7
+LINEAR_EVAL_TRAIN_FRACTION="${LINEAR_EVAL_TRAIN_FRACTION:-0.7}"
 LINEAR_EVAL_SPLIT_SEED=42
-CIFAR_DATASET="cifar10"
-CIFAR_DATA_DIR="$PWD/data/cifar"
+CIFAR_DATASET="${CIFAR_DATASET:-cifar10}"       # cifar10 | cifar100 | imagenet
+CIFAR_DATA_DIR="${CIFAR_DATA_DIR:-$PWD/data/cifar}"
+IMAGENET_DATA_DIR="${IMAGENET_DATA_DIR:-}"      # required when CIFAR_DATASET=imagenet
 CIFAR_DOWNLOAD=1
 
 # CSV logging
@@ -170,6 +172,7 @@ if [[ "${LINEAR_EVAL_EVERY}" -gt 0 ]]; then
   EXTRA_ARGS+=(--cifar-dataset "$CIFAR_DATASET")
   EXTRA_ARGS+=(--cifar-data-dir "$CIFAR_DATA_DIR")
   [[ "${CIFAR_DOWNLOAD}" == "1" ]] && EXTRA_ARGS+=(--cifar-download)
+  [[ -n "${IMAGENET_DATA_DIR}" ]] && EXTRA_ARGS+=(--imagenet-data-dir "$IMAGENET_DATA_DIR")
 fi
 
 # CSV logging configuration

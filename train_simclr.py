@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from evaluation.cifar_linear_eval import linear_eval_on_cifar
+from evaluation.imagenet_linear_eval import linear_eval_on_imagenet
 from losses.paired_cosine_tt import TemporalAllPairsTTLoss
 from models.simclr_resnet import SimCLRResNet18
 from utils.EgocentricWindowDataset_new import EgocentricWindowDataset
@@ -108,7 +109,7 @@ class CSVLogger:
         self._eval_file, self._eval_writer = self._open_writer(
             path=self.eval_path,
             append=append,
-            header=["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "test_loss", "test_acc"],
+            header=["epoch", "train_loss", "train_acc", "train_top5_acc", "val_loss", "val_acc", "val_top5_acc", "test_loss", "test_acc", "test_top5_acc"],
         )
 
     @staticmethod
@@ -146,10 +147,13 @@ class CSVLogger:
                 epoch,
                 self._to_scalar(eval_metrics.get("train_loss")),
                 self._to_scalar(eval_metrics.get("train_acc")),
+                self._to_scalar(eval_metrics.get("train_top5_acc")),
                 self._to_scalar(eval_metrics.get("val_loss")),
                 self._to_scalar(eval_metrics.get("val_acc")),
+                self._to_scalar(eval_metrics.get("val_top5_acc")),
                 self._to_scalar(eval_metrics.get("test_loss")),
                 self._to_scalar(eval_metrics.get("test_acc")),
+                self._to_scalar(eval_metrics.get("test_top5_acc")),
             ]
         )
         self._eval_file.flush()
@@ -221,9 +225,9 @@ class LinearEvalConfig:
     max_batches: Optional[int]
     train_fraction: float
     split_seed: int
-    dataset: str
+    dataset: str       # cifar10 | cifar100 | imagenet
     data_dir: str
-    download: bool
+    download: bool     # only used for CIFAR
 
 
 class SimCLRTrainer:
@@ -388,31 +392,49 @@ class SimCLRTrainer:
         if not self.linear_eval.every or epoch % self.linear_eval.every != 0:
             return
 
-        eval_metrics = linear_eval_on_cifar(
-            encoder=self.model.encoder,
-            feature_dim=self.model.feature_dim,
-            device=self.device,
-            image_size=self.image_size,
-            batch_size=self.linear_eval.batch_size,
-            num_workers=self.num_workers,
-            eval_epochs=self.linear_eval.epochs,
-            lr=self.linear_eval.lr,
-            weight_decay=self.linear_eval.weight_decay,
-            data_dir=self.linear_eval.data_dir,
-            dataset_name=self.linear_eval.dataset,
-            download=self.linear_eval.download,
-            train_fraction=self.linear_eval.train_fraction,
-            split_seed=self.linear_eval.split_seed,
-            max_batches=self.linear_eval.max_batches,
-        )
+        if self.linear_eval.dataset == "imagenet":
+            eval_metrics = linear_eval_on_imagenet(
+                encoder=self.model.encoder,
+                feature_dim=self.model.feature_dim,
+                device=self.device,
+                image_size=self.image_size,
+                batch_size=self.linear_eval.batch_size,
+                num_workers=self.num_workers,
+                eval_epochs=self.linear_eval.epochs,
+                lr=self.linear_eval.lr,
+                weight_decay=self.linear_eval.weight_decay,
+                data_dir=self.linear_eval.data_dir,
+                train_fraction=self.linear_eval.train_fraction,
+                split_seed=self.linear_eval.split_seed,
+                max_batches=self.linear_eval.max_batches,
+            )
+        else:
+            eval_metrics = linear_eval_on_cifar(
+                encoder=self.model.encoder,
+                feature_dim=self.model.feature_dim,
+                device=self.device,
+                image_size=self.image_size,
+                batch_size=self.linear_eval.batch_size,
+                num_workers=self.num_workers,
+                eval_epochs=self.linear_eval.epochs,
+                lr=self.linear_eval.lr,
+                weight_decay=self.linear_eval.weight_decay,
+                data_dir=self.linear_eval.data_dir,
+                dataset_name=self.linear_eval.dataset,
+                download=self.linear_eval.download,
+                train_fraction=self.linear_eval.train_fraction,
+                split_seed=self.linear_eval.split_seed,
+                max_batches=self.linear_eval.max_batches,
+            )
         eval_metrics["epoch"] = epoch
         self.history.setdefault("linear_eval", []).append(eval_metrics)
 
         print(
-            "Linear eval @ epoch {epoch}: train_acc={train_acc:.4f}, "
-            "val_acc={val_acc:.4f}, test_acc={test_acc:.4f}, "
-            "train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
-            "test_loss={test_loss:.4f}".format(**eval_metrics)
+            "Linear eval @ epoch {epoch}: "
+            "train_acc={train_acc:.4f} train_top5={train_top5_acc:.4f}, "
+            "val_acc={val_acc:.4f} val_top5={val_top5_acc:.4f}, "
+            "test_acc={test_acc:.4f} test_top5={test_top5_acc:.4f}, "
+            "train_loss={train_loss:.4f} val_loss={val_loss:.4f} test_loss={test_loss:.4f}".format(**eval_metrics)
         )
 
         if self.csv_logger is not None:
@@ -623,9 +645,17 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Seed for the CIFAR train/validation split used during linear eval.",
     )
-    parser.add_argument("--cifar-dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
+    parser.add_argument(
+        "--cifar-dataset", type=str, default="cifar10",
+        choices=["cifar10", "cifar100", "imagenet"],
+        help="Dataset for linear eval. Use 'imagenet' with --imagenet-data-dir.",
+    )
     parser.add_argument("--cifar-data-dir", type=str, default="data/cifar")
     parser.add_argument("--cifar-download", action="store_true", help="Download CIFAR if missing.")
+    parser.add_argument(
+        "--imagenet-data-dir", type=str, default=None,
+        help="Root dir for ImageNet-style linear eval (must contain train/ and val/ sub-folders).",
+    )
 
     # Checkpointing
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory to save checkpoints.")
@@ -706,7 +736,7 @@ def main() -> None:
             linear_eval_train_fraction=args.linear_eval_train_fraction,
             linear_eval_split_seed=args.linear_eval_split_seed,
             cifar_dataset=args.cifar_dataset,
-            cifar_data_dir=args.cifar_data_dir,
+            cifar_data_dir=args.imagenet_data_dir if args.cifar_dataset == "imagenet" else args.cifar_data_dir,
             cifar_download=args.cifar_download,
             csv_logger=csv_logger,
         )
