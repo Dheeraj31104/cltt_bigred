@@ -1,0 +1,7 @@
+# Training artifacts
+checkpoints/
+data/cifar/
+
+# Python cache
+__pycache__/
+*.py[cod]
