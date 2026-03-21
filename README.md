@@ -20,12 +20,43 @@ CLTT trains a SimCLR-style contrastive model on egocentric video **frame windows
 
 ```
 .
-├── train_simclr.py                     # Main training script (CLI, checkpoints, W&B, resume)
+├── train_simclr.py                         # Main training script (CLI, checkpoints, W&B, resume)
+├── eval_coil_sweep.py                      # Sweep COIL-20 linear eval across checkpoints
+├── eval_imagenet.py                        # Tiny ImageNet linear eval
+├── eval_knn_retrieval.py                   # k-NN retrieval evaluation
+├── visualize_temporal_dataset.py           # Dataset visualization utility
+├── make_plots.py                           # Generate result plots (PNG)
+│
+├── models/
+│   └── simclr_resnet.py                    # ResNet-18 encoder + projection head
+│
+├── losses/
+│   └── paired_cosine_tt.py                 # Multi-positive InfoNCE temporal loss
+│
+├── evaluation/
+│   ├── coil_linear_eval.py                 # COIL-20 linear probe
+│   ├── cifar_linear_eval.py                # CIFAR linear probe
+│   └── imagenet_linear_eval.py             # ImageNet linear probe
+│
 ├── utils/
-│   └── EgocentricWindowDataset_new.py  # Dataset for frame windows and temporal pairs
+│   ├── EgocentricWindowDataset_new.py      # Sliding-window egocentric video dataset
+│   └── analyze_egocentric_dataset.py       # Dataset statistics and analysis
+│
 ├── slurm/
-│   └── run_simclr_array.sh             # Slurm job-array template
-├── requirements.txt                    # Python dependencies
+│   ├── run_simclr_array.sh                 # Main training job array
+│   ├── eval_coil_sweep.sh                  # COIL eval job array
+│   ├── eval_coil_epochs_001_020.sh         # COIL eval for epochs 1–20
+│   ├── eval_coil_quick.sh                  # Quick COIL eval
+│   ├── eval_imagenet.sh                    # ImageNet eval job
+│   ├── eval_knn_retrieval.sh               # k-NN retrieval job
+│   └── debug_simclr.sh                     # Debug training job
+│
+├── plots/                                  # Generated result figures (PNG)
+├── results/                                # Evaluation CSVs
+├── checkpoints/                            # Saved model checkpoints
+├── outputs/                                # Visualization outputs
+│
+├── requirements.txt                        # Python dependencies
 └── README.md
 ```
 
